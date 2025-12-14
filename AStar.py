@@ -1,22 +1,21 @@
 """
 Maze Game with A* Pathfinding Algorithm and Catmull-Rom Spline Smoothing
 
-This file implements a maze game where a creature uses the A* algorithm 
+This file implements a maze pathfinding visualization using the A* algorithm 
 to find the shortest path from start to exit, then applies Catmull-Rom spline
-smoothing for a smoother, more natural movement trajectory.
+smoothing for a smoother path visualization.
 
 The A* algorithm is used for optimal pathfinding, preventing leaks through
 wall edges and finding the most efficient route through the maze. The path
-is then smoothed using Catmull-Rom spline interpolation for better aesthetics
-and more realistic creature movement.
+is then smoothed using Catmull-Rom spline interpolation for better visualization.
 
 Features:
 - A* pathfinding with wall edge leak prevention
 - Catmull-Rom spline path smoothing
 - Collision detection for smoothed paths
 - PNG image maze loading
-- Real-time visualization of path exploration
-- Creature animation following the smoothed optimal path
+- Visualization of path exploration and final path
+- Static path visualization with explored nodes
 """
 
 import sys
@@ -30,7 +29,6 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.animation import FuncAnimation
 
 # Try to import GPU acceleration libraries
 try:
@@ -634,8 +632,8 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         return rx, ry
 
 
-class Creature:
-    """Creature that navigates the maze using A* with Catmull-Rom spline smoothing"""
+class PathFinder:
+    """Pathfinder that uses A* algorithm with Catmull-Rom spline smoothing"""
     
     def __init__(self, maze):
         self.maze = maze
@@ -643,9 +641,7 @@ class Creature:
         self.original_path = []  # Store original A* path for visualization
         self.explored_nodes = []
         self.open_set_history = []
-        self.path_index = 0
         self.found_path = False
-        self.exploration_index = 0
         
     def _smooth_path_with_spline(self, path, num_points_per_segment=20):
         """
@@ -803,18 +799,6 @@ class Creature:
             return True
         return False
     
-    def get_current_position(self):
-        """Get current position of creature"""
-        if self.current_path and self.path_index < len(self.current_path):
-            return self.current_path[self.path_index]
-        return self.maze.start
-    
-    def move_next(self):
-        """Move to next position in path"""
-        if self.path_index < len(self.current_path) - 1:
-            self.path_index += 1
-            return True
-        return False
 
 
 class MazeGame:
@@ -829,11 +813,9 @@ class MazeGame:
             self.maze = create_maze()
         else:
             self.maze = maze
-        self.creature = Creature(self.maze)
+        self.pathfinder = PathFinder(self.maze)
         self.fig, self.ax = plt.subplots(figsize=(12, 12))
-        self.animation = None
         self.phase = 'moving'  # Skip exploration, show path immediately
-        self.frame_count = 0
         self.show_distance_map = show_distance_map
         self.distance_field = None
         self._colorbar_added = False
@@ -947,18 +929,18 @@ class MazeGame:
                        edgecolors='black', linewidths=2.5, zorder=5)
         
         # Draw all explored nodes (always show when path is found)
-        if self.creature.found_path and self.creature.explored_nodes:
-            explored = self.creature.explored_nodes
+        if self.pathfinder.found_path and self.pathfinder.explored_nodes:
+            explored = self.pathfinder.explored_nodes
             ex_x = [p[0] for p in explored]
             ex_y = [p[1] for p in explored]
             self.ax.scatter(ex_x, ex_y, c='lightblue', s=30, 
                            alpha=0.6, marker='o', label='Explored Nodes', zorder=2)
         
         # Draw all open set nodes from the final state (always show when path is found)
-        if self.creature.found_path and self.creature.open_set_history:
+        if self.pathfinder.found_path and self.pathfinder.open_set_history:
             # Get the final open set (last non-empty one)
             final_open_set = None
-            for open_set in reversed(self.creature.open_set_history):
+            for open_set in reversed(self.pathfinder.open_set_history):
                 if open_set:
                     final_open_set = open_set
                     break
@@ -970,29 +952,24 @@ class MazeGame:
                                alpha=0.7, marker='*', label='Open Set', zorder=3)
         
         # Draw final path (always show when found)
-        if self.creature.found_path and self.creature.current_path:
+        if self.pathfinder.found_path and self.pathfinder.current_path:
             # Draw original A* path (if different from smoothed path)
-            if hasattr(self.creature, 'original_path') and self.creature.original_path:
-                if len(self.creature.original_path) != len(self.creature.current_path):
-                    orig_x = [p[0] for p in self.creature.original_path]
-                    orig_y = [p[1] for p in self.creature.original_path]
+            if hasattr(self.pathfinder, 'original_path') and self.pathfinder.original_path:
+                if len(self.pathfinder.original_path) != len(self.pathfinder.current_path):
+                    orig_x = [p[0] for p in self.pathfinder.original_path]
+                    orig_y = [p[1] for p in self.pathfinder.original_path]
                     self.ax.plot(orig_x, orig_y, 'g--', linewidth=2, alpha=0.4, 
                                label='A* Path (Original)', zorder=3)
             
             # Draw smoothed spline path
-            path_x = [p[0] for p in self.creature.current_path]
-            path_y = [p[1] for p in self.creature.current_path]
+            path_x = [p[0] for p in self.pathfinder.current_path]
+            path_y = [p[1] for p in self.pathfinder.current_path]
             self.ax.plot(path_x, path_y, 'b-', linewidth=3, alpha=0.8, 
                         label='Smooth Path (Catmull-Rom)', zorder=4)
         
-        # Draw creature as simple circle
-        cx, cy = self.creature.get_current_position()
-        creature_circle = plt.Circle((cx, cy), 0.4, color='blue', zorder=10, ec='black', lw=1.5)
-        self.ax.add_patch(creature_circle)
-        
         # Update title
-        if self.creature.found_path:
-            title = f'Maze Game - A* Pathfinding with Catmull-Rom Spline (Path Found: {len(self.creature.current_path)} steps)'
+        if self.pathfinder.found_path:
+            title = f'Maze Game - A* Pathfinding with Catmull-Rom Spline (Path Found: {len(self.pathfinder.current_path)} steps)'
         else:
             title = f'Maze Game - A* Pathfinding with Catmull-Rom Spline'
         self.ax.set_title(title, fontsize=16, fontweight='bold')
@@ -1000,22 +977,11 @@ class MazeGame:
         self.ax.set_xlabel('X Position')
         self.ax.set_ylabel('Y Position')
     
-    def animate(self, frame):
-        """Animation function - show creature moving along path"""
-        self.frame_count = frame
-        
-        # Show creature moving along path (path is already drawn)
-        self.draw_maze(show_exploration=False)
-        if self.creature.path_index < len(self.creature.current_path) - 1:
-            if frame % 3 == 0:  # Move every 3 frames
-                self.creature.move_next()
-        
-        return []
     
     def run(self):
         """Run the game"""
         print("Finding path using A* algorithm...")
-        success = self.creature.find_path()
+        success = self.pathfinder.find_path()
         
         if not success:
             print("No path found!")
@@ -1023,17 +989,12 @@ class MazeGame:
             plt.show()
             return
         
-        print(f"Path found! Path length: {len(self.creature.current_path)} steps")
-        print(f"Explored {len(self.creature.explored_nodes)} nodes")
+        print(f"Path found! Path length: {len(self.pathfinder.current_path)} steps")
+        print(f"Explored {len(self.pathfinder.explored_nodes)} nodes")
         print("Displaying visualization...")
         
-        # Draw the maze with path immediately
+        # Draw the maze with path (static visualization, no animation)
         self.draw_maze(show_exploration=False)
-        
-        # Create animation for creature movement only
-        movement_frames = len(self.creature.current_path) * 3 + 20
-        self.animation = FuncAnimation(self.fig, self.animate, frames=movement_frames,
-                                      interval=50, repeat=True, blit=False)
         
         plt.tight_layout()
         plt.show()
