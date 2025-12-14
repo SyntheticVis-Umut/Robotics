@@ -3,7 +3,7 @@
   "num_points_per_segment": 15,
   "show_distance_map": true,
   "smoothing_enabled": true,
-  "distance_heat_gamma": 0.1,
+  "distance_heat_gamma": 0.5,
   "detection_mode": "canny",
   "canny_threshold1": 100,
   "canny_threshold2": 200,
