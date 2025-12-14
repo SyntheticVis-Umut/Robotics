@@ -7,6 +7,7 @@
   "detection_mode": "canny",
   "canny_threshold1": 100,
   "canny_threshold2": 200,
-  "map_file": "map.png"
+  "map_file": "map.png",
+  "grid_resolution": 10.0
 }
 

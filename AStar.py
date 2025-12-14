@@ -93,6 +93,7 @@ def load_planner_config():
         "canny_threshold1": 100,
         "canny_threshold2": 200,
         "map_file": None,
+        "grid_resolution": 1.0,  # Grid cell size in pixels. 1.0 = 1 pixel per node, 10.0 = 10x10 pixels per node
     }
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -1394,6 +1395,13 @@ class PathFinder:
         # Get obstacles
         ox, oy = self.maze.get_obstacle_list()
         
+        # Get grid resolution from config
+        grid_resolution = cfg.get("grid_resolution", CELL_SIZE)
+        print(f"[A*] Using grid resolution: {grid_resolution} pixels per node")
+        if grid_resolution > 1.0:
+            print(f"[A*] Each node represents a {grid_resolution}x{grid_resolution} pixel area")
+            print(f"[A*] This reduces search space from ~{len(ox)} to ~{int(len(ox) / (grid_resolution * grid_resolution))} nodes")
+        
         # Get distance field if available
         distance_field = None
         if use_distance_cost:
@@ -1408,7 +1416,8 @@ class PathFinder:
                 use_distance_cost = False
         
         # Create A* planner with tracking and distance field
-        planner = AStarPlannerWithTracking(ox, oy, CELL_SIZE, ROBOT_RADIUS, 
+        # Robot radius stays the same in world coordinates, but grid resolution affects search space
+        planner = AStarPlannerWithTracking(ox, oy, grid_resolution, ROBOT_RADIUS, 
                                           distance_field=distance_field,
                                           use_distance_cost=use_distance_cost,
                                           min_clearance_norm=min_clearance_norm)
