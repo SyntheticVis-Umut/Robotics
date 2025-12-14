@@ -211,47 +211,33 @@ class Maze:
             edge_coords = np.argwhere(self.canny_edge_map > 0)  # Returns (y, x) coordinates
             # Convert to (x, y) format
             oy, ox = edge_coords[:, 0], edge_coords[:, 1]
-            num_canny_edges = len(ox)
-            print(f"[Canny] Detected {num_canny_edges} edge pixels from Canny edge detection")
             ox = ox.tolist()
             oy = oy.tolist()
             
             # Add border walls
             border_x = list(range(self.width)) + list(range(self.width)) + [0] * self.height + [self.width - 1] * self.height
             border_y = [0] * self.width + [self.height - 1] * self.width + list(range(self.height)) + list(range(self.height))
-            num_border_points = len(border_x)
-            print(f"[Canny] Adding {num_border_points} border wall points")
             ox.extend(border_x)
             oy.extend(border_y)
-            
-            total_obstacles = len(ox)
-            print(f"[Canny] Total obstacles: {total_obstacles} ({num_canny_edges} Canny edges + {num_border_points} border points)")
         else:
             # Traditional method: build from walls set
             ox, oy = [], []
-            # Add border walls
-            for i in range(self.width):
-                ox.append(i)
-                oy.append(0)
-                ox.append(i)
-                oy.append(self.height - 1)
-            for i in range(self.height):
-                ox.append(0)
-                oy.append(i)
-                ox.append(self.width - 1)
-                oy.append(i)
-            
-            num_border_points = len(ox)
-            print(f"[Legacy] Adding {num_border_points} border wall points")
-            
-            # Add internal walls
-            num_walls = len(self.walls)
-            for wall_x, wall_y in self.walls:
-                ox.append(wall_x)
-                oy.append(wall_y)
-            
-            total_obstacles = len(ox)
-            print(f"[Legacy] Total obstacles: {total_obstacles} ({num_border_points} border points + {num_walls} internal walls)")
+        # Add border walls
+        for i in range(self.width):
+            ox.append(i)
+            oy.append(0)
+            ox.append(i)
+            oy.append(self.height - 1)
+        for i in range(self.height):
+            ox.append(0)
+            oy.append(i)
+            ox.append(self.width - 1)
+            oy.append(i)
+        
+        # Add internal walls
+        for wall_x, wall_y in self.walls:
+            ox.append(wall_x)
+            oy.append(wall_y)
         
         return ox, oy
     
@@ -492,62 +478,27 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         # Use GPU if available for distance calculations
         if GPU_AVAILABLE and GPU_USABLE:
             try:
-                num_obstacles = len(ox_array)
-                print(f"[GPU] Computing obstacle map on GPU (processing {num_obstacles} obstacles in batches)...")
-                
-                # Transfer grid to GPU (only once)
+                print("[GPU] Computing obstacle map on GPU...")
+                # Transfer to GPU
                 X_gpu = cp.asarray(X)
                 Y_gpu = cp.asarray(Y)
+                ox_gpu = cp.asarray(ox_array)
+                oy_gpu = cp.asarray(oy_array)
                 rr_gpu = cp.float32(self.rr)
                 
-                # Initialize obstacle map on GPU
-                obstacle_map_gpu = cp.zeros((self.x_width, self.y_width), dtype=cp.bool_)
+                # Compute distances using broadcasting on GPU
+                # Shape: (x_width, y_width, num_obstacles)
+                dx = X_gpu[:, :, cp.newaxis] - ox_gpu[cp.newaxis, cp.newaxis, :]
+                dy = Y_gpu[:, :, cp.newaxis] - oy_gpu[cp.newaxis, cp.newaxis, :]
+                distances = cp.sqrt(dx * dx + dy * dy)
                 
-                # Process obstacles in batches to avoid memory issues
-                # Calculate optimal batch size based on available GPU memory
-                # For Tesla T4 (15GB), we can safely use ~2000 obstacles per batch
-                # This uses ~2.2 GB per batch, leaving plenty of headroom
-                batch_size = 2000
+                # Check if any obstacle is within robot radius
+                # Shape: (x_width, y_width)
+                obstacle_map_gpu = cp.any(distances <= rr_gpu, axis=2)
                 
-                num_batches = (num_obstacles + batch_size - 1) // batch_size
-                print(f"[GPU] Processing {num_obstacles} obstacles in {num_batches} batches of ~{batch_size}")
-                
-                for batch_idx in range(0, num_obstacles, batch_size):
-                    end_idx = min(batch_idx + batch_size, num_obstacles)
-                    batch_num = (batch_idx // batch_size) + 1
-                    
-                    # Transfer batch to GPU
-                    ox_batch = cp.asarray(ox_array[batch_idx:end_idx])
-                    oy_batch = cp.asarray(oy_array[batch_idx:end_idx])
-                    
-                    # Compute distances for this batch using broadcasting
-                    # Shape: (x_width, y_width, batch_size)
-                    dx = X_gpu[:, :, cp.newaxis] - ox_batch[cp.newaxis, cp.newaxis, :]
-                    dy = Y_gpu[:, :, cp.newaxis] - oy_batch[cp.newaxis, cp.newaxis, :]
-                    distances = cp.sqrt(dx * dx + dy * dy)
-                    
-                    # Check if any obstacle in this batch is within robot radius
-                    # Shape: (x_width, y_width)
-                    batch_obstacles = cp.any(distances <= rr_gpu, axis=2)
-                    
-                    # Combine with previous results using OR operation
-                    obstacle_map_gpu = obstacle_map_gpu | batch_obstacles
-                    
-                    # Free GPU memory for this batch
-                    del dx, dy, distances, batch_obstacles, ox_batch, oy_batch
-                    cp.get_default_memory_pool().free_all_blocks()
-                    
-                    if batch_num % 5 == 0 or batch_num == num_batches:
-                        print(f"[GPU] Processed batch {batch_num}/{num_batches} ({end_idx}/{num_obstacles} obstacles)")
-                
-                # Transfer final result to CPU
+                # Transfer back to CPU
                 obstacle_map = cp.asnumpy(obstacle_map_gpu)
-                print(f"[GPU] ✓ Obstacle map computed on GPU ({num_obstacles} obstacles processed in {num_batches} batches)")
-                
-                # Clean up GPU memory
-                del X_gpu, Y_gpu, obstacle_map_gpu
-                cp.get_default_memory_pool().free_all_blocks()
-                
+                print("[GPU] ✓ Obstacle map computed on GPU")
             except Exception as e:
                 print(f"[GPU] ⚠ GPU computation failed: {e}, using CPU")
                 # Fallback to CPU vectorized
