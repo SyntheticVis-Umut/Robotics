@@ -1,17 +1,22 @@
 """
-Maze Game with Dijkstra Pathfinding Algorithm
+Maze Game with Dijkstra Pathfinding Algorithm and Catmull-Rom Spline Smoothing
 
 This file implements a maze game where a creature uses the Dijkstra algorithm 
-to find the shortest path from start to exit.
+to find the shortest path from start to exit, then applies Catmull-Rom spline
+smoothing for a smoother, more natural movement trajectory.
 
 The Dijkstra algorithm is used for optimal pathfinding, finding the most 
-efficient route through the maze without heuristics.
+efficient route through the maze without heuristics. The path is then smoothed
+using Catmull-Rom spline interpolation for better aesthetics and more realistic
+creature movement.
 
 Features:
 - Dijkstra pathfinding with wall edge leak prevention
+- Catmull-Rom spline path smoothing
+- Collision detection for smoothed paths
 - PNG image maze loading
 - Real-time visualization of path exploration
-- Creature animation following the optimal path
+- Creature animation following the smoothed optimal path
 """
 
 import sys
@@ -19,6 +24,7 @@ import os
 import math
 import glob
 import heapq
+import json
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -28,6 +34,8 @@ from matplotlib.animation import FuncAnimation
 # Add the pythonrobotics path to import Dijkstra algorithm
 sys.path.insert(0, '/Users/umutozdemir/Desktop/pythonrobotics')
 from PathPlanning.Dijkstra import dijkstra
+from PathPlanning.Catmull_RomSplinePath.catmull_rom_spline_path import catmull_rom_spline
+from Mapping.DistanceMap.distance_map import compute_udf_scipy, compute_sdf_scipy
 
 # Try to import GPU acceleration libraries
 try:
@@ -70,6 +78,31 @@ MAZE_WIDTH = 20
 MAZE_HEIGHT = 20
 CELL_SIZE = 1.0
 ROBOT_RADIUS = 0.3  # Increased to prevent edge leaks, but still small enough for paths
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "path_config.json")
+
+
+def load_planner_config():
+    """Load planner configuration from JSON; fall back to defaults if missing/invalid."""
+    defaults = {
+        "use_distance_cost": True,
+        "min_clearance_norm": 0.50,
+        "num_points_per_segment": 15,
+        "show_distance_map": True,
+        "smoothing_enabled": True,
+        "distance_heat_gamma": 1.0,
+    }
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = data[k]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[Config] Warning: failed to load path_config.json: {e}")
+    return defaults
 
 
 class Maze:
@@ -122,6 +155,48 @@ class Maze:
             oy.append(wall_y)
         
         return ox, oy
+    
+    def get_obstacle_map_2d(self):
+        """
+        Create a 2D boolean array representing obstacles for distance mapping.
+        Returns a numpy array where True = obstacle, False = free space.
+        """
+        obstacle_map = np.zeros((self.width, self.height), dtype=bool)
+        
+        # Add border walls
+        obstacle_map[:, 0] = True  # Top border
+        obstacle_map[:, self.height - 1] = True  # Bottom border
+        obstacle_map[0, :] = True  # Left border
+        obstacle_map[self.width - 1, :] = True  # Right border
+        
+        # Add internal walls
+        for wall_x, wall_y in self.walls:
+            if 0 <= wall_x < self.width and 0 <= wall_y < self.height:
+                obstacle_map[int(wall_x), int(wall_y)] = True
+        
+        return obstacle_map
+    
+    def compute_distance_field(self, use_sdf=True):
+        """
+        Compute distance field from obstacles.
+        
+        Args:
+            use_sdf: If True, compute Signed Distance Field (SDF).
+                    If False, compute Unsigned Distance Field (UDF).
+        
+        Returns:
+            Distance field array (2D numpy array)
+        """
+        obstacle_map = self.get_obstacle_map_2d()
+        
+        # Note: distance_map functions expect obstacles as 1, free space as 0
+        # Our obstacle_map already has this format (True=1, False=0)
+        obstacles_bool = obstacle_map.astype(int)
+        
+        if use_sdf:
+            return compute_sdf_scipy(obstacles_bool)
+        else:
+            return compute_udf_scipy(obstacles_bool)
     
     @staticmethod
     def from_image(image_path, start_pos=None, exit_pos=None):
@@ -287,9 +362,9 @@ def create_maze():
 
 
 class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
-    """Optimized Dijkstra planner with GPU support, tracking, and wall edge leak prevention"""
+    """Optimized Dijkstra planner with GPU support, tracking, wall edge leak prevention, and distance field cost"""
     
-    def __init__(self, ox, oy, resolution, rr):
+    def __init__(self, ox, oy, resolution, rr, distance_field=None, use_distance_cost=True, min_clearance_norm=0.50):
         # Temporarily disable animation in parent class
         original_show = dijkstra.show_animation
         dijkstra.show_animation = False
@@ -301,6 +376,25 @@ class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
         
         # Pre-compute motion model as numpy array for vectorization
         self.motion_array = np.array(self.motion, dtype=np.float32)
+        
+        # Distance field for safety-aware pathfinding
+        # Store original distance field and maze info for mapping
+        self.distance_field = distance_field
+        self.use_distance_cost = use_distance_cost and (distance_field is not None)
+        self.min_clearance_norm = min_clearance_norm  # Hard cutoff for minimum normalized clearance
+        
+        if self.use_distance_cost:
+            print(f"[Dijkstra] ✓ Distance field cost enabled")
+            # Normalize distance field to [0, 1] for cost calculation
+            if distance_field is not None:
+                max_dist = np.max(distance_field)
+                if max_dist > 0:
+                    self.distance_field_norm = distance_field / max_dist
+                else:
+                    self.distance_field_norm = distance_field
+                    self.use_distance_cost = False
+        else:
+            self.distance_field_norm = None
         
         # Use GPU for obstacle map if available and usable
         self.use_gpu = False
@@ -476,6 +570,29 @@ class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
                 new_y = current.y + move_y
                 new_cost = current.cost + move_cost
                 
+                # Add clearance check based on distance field (if enabled)
+                if self.use_distance_cost and self.distance_field_norm is not None:
+                    # Get position in world coordinates
+                    px = self.calc_position(new_x, self.min_x)
+                    py = self.calc_position(new_y, self.min_y)
+                    
+                    # Map world coordinates to distance field grid indices
+                    # Distance field is computed on maze grid (0 to width, 0 to height)
+                    # We need to map planner's world coordinates to maze grid
+                    df_width, df_height = self.distance_field_norm.shape
+                    
+                    # Convert world coordinates to maze grid indices
+                    # Assuming maze grid starts at (0, 0) and matches distance field
+                    maze_x = int(np.clip(px, 0, df_width - 1))
+                    maze_y = int(np.clip(py, 0, df_height - 1))
+                    
+                    # Get normalized distance (0 = at wall, 1 = far from wall)
+                    if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
+                        dist_value = self.distance_field_norm[maze_x, maze_y]
+                        # Hard clearance cutoff: skip nodes below threshold
+                        if dist_value < self.min_clearance_norm:
+                            continue
+                
                 node = self.Node(new_x, new_y, new_cost, c_id)
                 n_id = self.calc_index(node)
 
@@ -503,24 +620,140 @@ class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
 
 
 class Creature:
-    """Creature that navigates the maze using Dijkstra"""
+    """Creature that navigates the maze using Dijkstra with Catmull-Rom spline smoothing"""
     
     def __init__(self, maze):
         self.maze = maze
         self.current_path = []
+        self.original_path = []  # Store original Dijkstra path for visualization
         self.explored_nodes = []
         self.open_set_history = []
         self.path_index = 0
         self.found_path = False
         self.exploration_index = 0
         
-    def find_path(self):
-        """Use Dijkstra to find path from start to exit"""
+    def _smooth_path_with_spline(self, path, num_points_per_segment=20):
+        """
+        Apply Catmull-Rom spline smoothing to the Dijkstra path
+        
+        Args:
+            path: List of (x, y) tuples representing the Dijkstra path
+            num_points_per_segment: Number of points to generate per spline segment
+        
+        Returns:
+            List of (x, y) tuples representing the smoothed path
+        """
+        if len(path) < 2:
+            return path
+        
+        # If path is too short, just return it
+        if len(path) == 2:
+            # Interpolate between two points
+            p0, p1 = path[0], path[1]
+            t_vals = np.linspace(0, 1, num_points_per_segment)
+            smoothed = []
+            for t in t_vals:
+                x = p0[0] + t * (p1[0] - p0[0])
+                y = p0[1] + t * (p1[1] - p0[1])
+                smoothed.append((x, y))
+            return smoothed
+        
+        # Convert path to numpy array for spline processing
+        control_points = np.array(path)
+        
+        # Calculate total number of points for the smoothed path
+        # Use more points for longer paths to maintain smoothness
+        total_segments = len(path) - 1
+        total_points = total_segments * num_points_per_segment
+        
+        # Apply Catmull-Rom spline
+        # The function returns a transposed array: shape (2, N) where [0] is x and [1] is y
+        spline_result = catmull_rom_spline(control_points, num_points_per_segment)
+        
+        # Extract x and y coordinates
+        # spline_result is shape (2, N) after transpose
+        if spline_result.shape[0] == 2:
+            spline_x, spline_y = spline_result[0], spline_result[1]
+        else:
+            # Fallback: if shape is (N, 2), transpose it
+            spline_result = spline_result.T
+            spline_x, spline_y = spline_result[0], spline_result[1]
+        
+        # Convert back to list of tuples
+        smoothed_path = list(zip(spline_x, spline_y))
+        
+        # Ensure start and end points are exactly as in original path
+        if smoothed_path:
+            smoothed_path[0] = path[0]
+            smoothed_path[-1] = path[-1]
+        
+        return smoothed_path
+    
+    def _check_path_collision(self, path):
+        """
+        Check if smoothed path collides with walls
+        Returns True if path is safe, False if it collides
+        """
+        for x, y in path:
+            # Check if point is within maze bounds
+            if x < 0 or x >= self.maze.width or y < 0 or y >= self.maze.height:
+                return False
+            
+            # Check if point is in a wall cell
+            wall_x, wall_y = int(round(x)), int(round(y))
+            if self.maze.is_wall(wall_x, wall_y):
+                return False
+            
+            # Check nearby cells for safety margin
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    check_x, check_y = wall_x + dx, wall_y + dy
+                    if self.maze.is_wall(check_x, check_y):
+                        # Check distance to wall
+                        dist = math.sqrt((x - check_x)**2 + (y - check_y)**2)
+                        if dist < ROBOT_RADIUS:
+                            return False
+        
+        return True
+        
+    def find_path(self, use_distance_cost=None, min_clearance_norm=None, num_points_per_segment=None, smoothing_enabled=None):
+        """
+        Use Dijkstra to find path from start to exit, then smooth with Catmull-Rom spline
+        
+        Args:
+            use_distance_cost: If True, use distance field to prefer safer paths
+            min_clearance_norm: Minimum normalized clearance (0-1). Nodes below this are treated as blocked.
+            num_points_per_segment: Number of points per segment for spline smoothing
+            smoothing_enabled: If False, skip spline smoothing
+        """
+        cfg = load_planner_config()
+        use_distance_cost = cfg["use_distance_cost"] if use_distance_cost is None else use_distance_cost
+        gamma = cfg.get("distance_heat_gamma", 1.0)
+        if min_clearance_norm is None:
+            min_clearance_norm = max(0.05, min(0.95, gamma))
+        num_points_per_segment = cfg.get("num_points_per_segment", 15) if num_points_per_segment is None else num_points_per_segment
+        smoothing_enabled = cfg.get("smoothing_enabled", True) if smoothing_enabled is None else smoothing_enabled
         # Get obstacles
         ox, oy = self.maze.get_obstacle_list()
         
-        # Create Dijkstra planner with tracking
-        planner = DijkstraPlannerWithTracking(ox, oy, CELL_SIZE, ROBOT_RADIUS)
+        # Get distance field if available
+        distance_field = None
+        if use_distance_cost:
+            try:
+                distance_field = self.maze.compute_distance_field(use_sdf=False)
+                # Need to map it to the planner's grid resolution
+                # The planner uses a grid based on obstacle bounds, so we need to interpolate
+                print("[Dijkstra] Distance field available for safety-aware pathfinding")
+            except Exception as e:
+                print(f"[Dijkstra] Could not compute distance field: {e}")
+                distance_field = None
+                use_distance_cost = False
+        
+        # Create Dijkstra planner with tracking and distance field
+        planner = DijkstraPlannerWithTracking(ox, oy, CELL_SIZE, ROBOT_RADIUS,
+                                             distance_field=distance_field,
+                                             use_distance_cost=use_distance_cost,
+                                             min_clearance_norm=min_clearance_norm)
         
         # Find path
         sx, sy = self.maze.start
@@ -529,8 +762,25 @@ class Creature:
         rx, ry = planner.planning(sx, sy, gx, gy)
         
         if rx and ry:
-            self.current_path = list(zip(rx, ry))
-            self.current_path.reverse()  # Reverse to go from start to goal
+            # Store original Dijkstra path
+            self.original_path = list(zip(rx, ry))
+            self.original_path.reverse()  # Reverse to go from start to goal
+            
+            if smoothing_enabled:
+                # Apply Catmull-Rom spline smoothing
+                print("[Spline] Applying Catmull-Rom spline smoothing to Dijkstra path...")
+                smoothed_path = self._smooth_path_with_spline(self.original_path, num_points_per_segment=num_points_per_segment)
+                
+                # Check if smoothed path is collision-free
+                if self._check_path_collision(smoothed_path):
+                    print(f"[Spline] ✓ Smoothed path is collision-free ({len(smoothed_path)} points)")
+                    self.current_path = smoothed_path
+                else:
+                    print("[Spline] ⚠ Smoothed path has collisions, using original Dijkstra path")
+                    self.current_path = self.original_path
+            else:
+                self.current_path = self.original_path
+            
             self.explored_nodes = planner.explored_nodes
             self.open_set_history = planner.open_set_history
             self.found_path = True
@@ -554,7 +804,11 @@ class Creature:
 class MazeGame:
     """Main game class with visualization"""
     
-    def __init__(self, maze=None):
+    def __init__(self, maze=None, show_distance_map=None):
+        cfg = load_planner_config()
+        if show_distance_map is None:
+            show_distance_map = cfg.get("show_distance_map", True)
+        
         if maze is None:
             self.maze = create_maze()
         else:
@@ -564,6 +818,19 @@ class MazeGame:
         self.animation = None
         self.phase = 'exploring'  # 'exploring' or 'moving'
         self.frame_count = 0
+        self.show_distance_map = show_distance_map
+        self.distance_field = None
+        self._colorbar_added = False
+        
+        # Compute distance field if enabled
+        if self.show_distance_map:
+            try:
+                print("[Distance Map] Computing distance field...")
+                self.distance_field = self.maze.compute_distance_field(use_sdf=False)  # Use UDF for visualization
+                print("[Distance Map] ✓ Distance field computed successfully")
+            except Exception as e:
+                print(f"[Distance Map] ✗ Failed to compute distance field: {e}")
+                self.show_distance_map = False
     
     def _draw_walls_as_rectangles(self):
         """Draw walls as continuous rectangles instead of individual cells"""
@@ -628,18 +895,40 @@ class MazeGame:
         self.ax.set_aspect('equal')
         self.ax.grid(True, alpha=0.3)
         
+        # Draw distance field as background (if enabled)
+        if self.show_distance_map and self.distance_field is not None:
+            cfg = load_planner_config()
+            gamma = cfg.get("distance_heat_gamma", 1.0)
+            df = self.distance_field
+            df_norm = (df - df.min()) / (df.max() - df.min() + 1e-8)
+            df_vis = np.power(df_norm, gamma)
+            # Transpose for correct orientation (distance_field is width x height, but imshow expects height x width)
+            distance_plot = self.ax.imshow(
+                df_vis.T,
+                extent=[-0.5, self.maze.width - 0.5, -0.5, self.maze.height - 0.5],
+                origin='lower',
+                cmap='viridis',
+                alpha=0.3,
+                interpolation='bilinear',
+                zorder=0
+            )
+            # Add colorbar
+            if not self._colorbar_added:
+                plt.colorbar(distance_plot, ax=self.ax, label='Distance to Nearest Obstacle', shrink=0.8)
+                self._colorbar_added = True
+        
         # Draw walls as continuous rectangles
         self._draw_walls_as_rectangles()
         
-        # Draw start position
+        # Draw start position (bold circle)
         sx, sy = self.maze.start
-        self.ax.scatter(sx, sy, c='green', s=300, marker='o', 
-                       edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+        self.ax.scatter(sx, sy, c='green', s=280, marker='o',
+                       edgecolors='black', linewidths=2.5, zorder=5)
         
-        # Draw exit position
+        # Draw exit position (bold circle)
         ex, ey = self.maze.exit
-        self.ax.scatter(ex, ey, c='red', s=300, marker='s', 
-                       edgecolors='darkred', linewidths=2, label='Exit', zorder=5)
+        self.ax.scatter(ex, ey, c='red', s=320, marker='o',
+                       edgecolors='black', linewidths=2.5, zorder=5)
         
         # Draw exploration process
         if show_exploration and self.creature.found_path:
@@ -663,26 +952,32 @@ class MazeGame:
         
         # Draw final path
         if self.creature.found_path and self.creature.current_path and not show_exploration:
+            # Draw original Dijkstra path (if different from smoothed path)
+            if hasattr(self.creature, 'original_path') and self.creature.original_path:
+                if len(self.creature.original_path) != len(self.creature.current_path):
+                    orig_x = [p[0] for p in self.creature.original_path]
+                    orig_y = [p[1] for p in self.creature.original_path]
+                    self.ax.plot(orig_x, orig_y, 'g--', linewidth=2, alpha=0.4, 
+                               label='Dijkstra Path (Original)', zorder=3)
+            
+            # Draw smoothed spline path
             path_x = [p[0] for p in self.creature.current_path]
             path_y = [p[1] for p in self.creature.current_path]
-            self.ax.plot(path_x, path_y, 'b-', linewidth=3, alpha=0.7, label='Path', zorder=4)
+            self.ax.plot(path_x, path_y, 'b-', linewidth=3, alpha=0.8, 
+                        label='Smooth Path (Catmull-Rom)', zorder=4)
         
-        # Draw creature
+        # Draw creature as simple circle
         cx, cy = self.creature.get_current_position()
-        creature_circle = plt.Circle((cx, cy), 0.4, color='blue', zorder=10)
+        creature_circle = plt.Circle((cx, cy), 0.4, color='blue', zorder=10, ec='black', lw=1.5)
         self.ax.add_patch(creature_circle)
-        # Add eyes to make it look like a creature
-        self.ax.scatter([cx - 0.15, cx + 0.15], [cy + 0.1, cy + 0.1], 
-                       c='white', s=50, zorder=11)
         
         # Update title based on phase
         if show_exploration:
-            title = f'Maze Game - Dijkstra Pathfinding (Exploring: {self.creature.exploration_index + 1}/{len(self.creature.explored_nodes)})'
+            title = f'Maze Game - Dijkstra Pathfinding with Catmull-Rom Spline (Exploring: {self.creature.exploration_index + 1}/{len(self.creature.explored_nodes)})'
         else:
-            title = f'Maze Game - Dijkstra Pathfinding (Moving to Exit)'
+            title = f'Maze Game - Dijkstra Pathfinding with Catmull-Rom Spline (Moving to Exit)'
         self.ax.set_title(title, fontsize=16, fontweight='bold')
         
-        self.ax.legend(loc='upper right', fontsize=9)
         self.ax.set_xlabel('X Position')
         self.ax.set_ylabel('Y Position')
     

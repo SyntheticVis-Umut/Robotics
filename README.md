@@ -125,6 +125,29 @@ python3 HybridAStar.py # Hybrid A*
 python3 PSO.py        # PSO
 ```
 
+## Configurable Path Settings (A* & Dijkstra)
+
+Both A* and Dijkstra read runtime parameters from `path_config.json`:
+- `use_distance_cost` (bool): Distance-field-based clearance filtering (true/false)
+- `min_clearance_norm` (float 0–1): Hard cutoff; nodes below this clearance are blocked
+- `num_points_per_segment` (int): Spline smoothing density (higher = smoother, slower)
+- `show_distance_map` (bool): Show distance-field heatmap in the background
+- `smoothing_enabled` (bool): Enable/disable Catmull-Rom smoothing
+- `distance_heat_gamma` (float): Adjusts heatmap contrast ( >1 = hotter near obstacles, <1 = softer )
+
+Current defaults (editable in `path_config.json`):
+```json
+{
+  "use_distance_cost": true,
+  "min_clearance_norm": 0.4,
+  "num_points_per_segment": 15,
+  "show_distance_map": true,
+  "smoothing_enabled": true,
+  "distance_heat_gamma": 1.0
+}
+```
+Update this file to adjust clearance, smoothing, and visualization without touching code.
+
 ## Loading Mazes from PNG Images
 
 1. Place your PNG maze images in the `maps/` folder
