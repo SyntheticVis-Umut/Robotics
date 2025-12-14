@@ -3,12 +3,12 @@
   "num_points_per_segment": 15,
   "show_distance_map": true,
   "smoothing_enabled": true,
-  "distance_heat_gamma": 0.05,
+  "distance_heat_gamma": 0.1,
   "detection_mode": "canny",
   "canny_threshold1": 100,
   "canny_threshold2": 200,
   "map_file": "map.png",
-  "grid_resolution": 20.0,
+  "grid_resolution": 1.0,
   "obstacle_map_resolution": 1.0
 }
 
