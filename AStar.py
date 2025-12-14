@@ -93,7 +93,8 @@ def load_planner_config():
         "canny_threshold1": 100,
         "canny_threshold2": 200,
         "map_file": None,
-        "grid_resolution": 1.0,  # Grid cell size in pixels. 1.0 = 1 pixel per node, 10.0 = 10x10 pixels per node
+        "grid_resolution": 1.0,  # Node grid cell size in pixels. 1.0 = 1 pixel per node, 10.0 = 10x10 pixels per node
+        "obstacle_map_resolution": 1.0,  # Obstacle map resolution for collision detection. 1.0 = full pixel resolution (max sensitivity)
     }
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -449,6 +450,9 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         Optimized obstacle map calculation using vectorized operations.
         Much faster than the original triple-nested loop, especially for large maps.
         Uses GPU if available, otherwise vectorized CPU operations.
+        
+        Note: obstacle_map_resolution controls collision detection precision,
+        while self.resolution controls node grid size.
         """
         self.min_x = round(min(ox))
         self.min_y = round(min(oy))
@@ -459,15 +463,30 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         print("max_x:", self.max_x)
         print("max_y:", self.max_y)
 
+        # Node grid size (for A* search space)
         self.x_width = round((self.max_x - self.min_x) / self.resolution)
         self.y_width = round((self.max_y - self.min_y) / self.resolution)
         print("x_width:", self.x_width)
         print("y_width:", self.y_width)
 
+        # Obstacle map size (for collision detection precision)
+        # Use obstacle_map_resolution for precise collision checking
+        obstacle_x_width = round((self.max_x - self.min_x) / self.obstacle_map_resolution)
+        obstacle_y_width = round((self.max_y - self.min_y) / self.obstacle_map_resolution)
+        print(f"[Obstacle Map] Resolution: {self.obstacle_map_resolution}, Size: {obstacle_x_width}x{obstacle_y_width}")
+
         # Use vectorized operations for much faster obstacle map generation
-        # Create grid coordinates
+        # Create obstacle map grid coordinates (at obstacle_map_resolution)
+        obstacle_x_coords = np.arange(obstacle_x_width) * self.obstacle_map_resolution + self.min_x
+        obstacle_y_coords = np.arange(obstacle_y_width) * self.obstacle_map_resolution + self.min_y
+        
+        # Create meshgrid for obstacle map (full resolution)
+        X_obstacle, Y_obstacle = np.meshgrid(obstacle_x_coords, obstacle_y_coords, indexing='ij')
+        
+        # Also create node grid coordinates (at node grid resolution) for sampling
         x_coords = np.arange(self.x_width) * self.resolution + self.min_x
         y_coords = np.arange(self.y_width) * self.resolution + self.min_y
+        X, Y = np.meshgrid(x_coords, y_coords, indexing='ij')
         
         # Create meshgrid for all grid points
         X, Y = np.meshgrid(x_coords, y_coords, indexing='ij')
@@ -482,15 +501,15 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                 num_obstacles = len(ox_array)
                 batch_size = 2000  # Process obstacles in batches to avoid GPU memory issues
                 
-                print(f"[GPU] Computing obstacle map on GPU (processing {num_obstacles} obstacles in batches)...")
+                print(f"[GPU] Computing obstacle map on GPU at {self.obstacle_map_resolution}px resolution (processing {num_obstacles} obstacles in batches)...")
                 
-                # Transfer grid coordinates to GPU (only once)
-                X_gpu = cp.asarray(X)
-                Y_gpu = cp.asarray(Y)
+                # Transfer obstacle map grid coordinates to GPU (full resolution for collision detection)
+                X_obstacle_gpu = cp.asarray(X_obstacle)
+                Y_obstacle_gpu = cp.asarray(Y_obstacle)
                 rr_gpu = cp.float32(self.rr)
                 
-                # Initialize obstacle map on GPU (all False initially)
-                obstacle_map_gpu = cp.zeros((self.x_width, self.y_width), dtype=cp.bool_)
+                # Initialize full-resolution obstacle map on GPU (all False initially)
+                obstacle_map_full_gpu = cp.zeros((obstacle_x_width, obstacle_y_width), dtype=cp.bool_)
                 
                 # Process obstacles in batches
                 num_batches = (num_obstacles + batch_size - 1) // batch_size
@@ -507,39 +526,69 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                     oy_batch_gpu = cp.asarray(batch_oy)
                     
                     # Compute distances using broadcasting on GPU for this batch
-                    # Shape: (x_width, y_width, batch_size)
-                    dx = X_gpu[:, :, cp.newaxis] - ox_batch_gpu[cp.newaxis, cp.newaxis, :]
-                    dy = Y_gpu[:, :, cp.newaxis] - oy_batch_gpu[cp.newaxis, cp.newaxis, :]
+                    # Shape: (obstacle_x_width, obstacle_y_width, batch_size)
+                    dx = X_obstacle_gpu[:, :, cp.newaxis] - ox_batch_gpu[cp.newaxis, cp.newaxis, :]
+                    dy = Y_obstacle_gpu[:, :, cp.newaxis] - oy_batch_gpu[cp.newaxis, cp.newaxis, :]
                     distances = cp.sqrt(dx * dx + dy * dy)
                     
                     # Check if any obstacle in this batch is within robot radius
-                    # Shape: (x_width, y_width)
+                    # Shape: (obstacle_x_width, obstacle_y_width)
                     batch_obstacle_map = cp.any(distances <= rr_gpu, axis=2)
                     
                     # Accumulate results using logical OR
-                    obstacle_map_gpu = obstacle_map_gpu | batch_obstacle_map
+                    obstacle_map_full_gpu = obstacle_map_full_gpu | batch_obstacle_map
                     
                     # Free GPU memory for this batch
                     del dx, dy, distances, batch_obstacle_map, ox_batch_gpu, oy_batch_gpu
                     cp.get_default_memory_pool().free_all_blocks()
                 
-                # Transfer final result back to CPU
-                obstacle_map = cp.asnumpy(obstacle_map_gpu)
+                # Transfer full-resolution obstacle map back to CPU
+                obstacle_map_full = cp.asnumpy(obstacle_map_full_gpu)
+                
+                # Sample full-resolution obstacle map at node grid positions
+                # Convert node grid positions to obstacle map indices
+                node_x_indices = ((X - self.min_x) / self.obstacle_map_resolution).astype(int)
+                node_y_indices = ((Y - self.min_y) / self.obstacle_map_resolution).astype(int)
+                
+                # Clip indices to valid range
+                node_x_indices = np.clip(node_x_indices, 0, obstacle_x_width - 1)
+                node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
+                
+                # Sample obstacle map at node grid positions
+                obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
                 
                 # Clean up GPU memory
-                del X_gpu, Y_gpu, obstacle_map_gpu
+                del X_obstacle_gpu, Y_obstacle_gpu, obstacle_map_full_gpu
                 cp.get_default_memory_pool().free_all_blocks()
                 
-                print("[GPU] ✓ Obstacle map computed on GPU")
+                print("[GPU] ✓ Obstacle map computed on GPU at full resolution and sampled to node grid")
             except Exception as e:
                 print(f"[GPU] ⚠ GPU computation failed: {e}, using CPU")
                 # Fallback to CPU vectorized
-                obstacle_map = self._calc_obstacle_map_cpu_vectorized(X, Y, ox_array, oy_array)
+                obstacle_map_full = self._calc_obstacle_map_cpu_vectorized(X_obstacle, Y_obstacle, ox_array, oy_array)
+                
+                # Sample full-resolution obstacle map at node grid positions
+                node_x_indices = ((X - self.min_x) / self.obstacle_map_resolution).astype(int)
+                node_y_indices = ((Y - self.min_y) / self.obstacle_map_resolution).astype(int)
+                node_x_indices = np.clip(node_x_indices, 0, obstacle_x_width - 1)
+                node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
+                obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
         else:
             # Use CPU vectorized operations
-            obstacle_map = self._calc_obstacle_map_cpu_vectorized(X, Y, ox_array, oy_array)
+            obstacle_map_full = self._calc_obstacle_map_cpu_vectorized(X_obstacle, Y_obstacle, ox_array, oy_array)
+            
+            # Sample full-resolution obstacle map at node grid positions
+            node_x_indices = ((X - self.min_x) / self.obstacle_map_resolution).astype(int)
+            node_y_indices = ((Y - self.min_y) / self.obstacle_map_resolution).astype(int)
+            node_x_indices = np.clip(node_x_indices, 0, obstacle_x_width - 1)
+            node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
+            obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
         
-        # Convert to list of lists format expected by parent class
+        # Store full-resolution obstacle map for later use
+        self.obstacle_map_full = obstacle_map_full
+        self.obstacle_map_full_resolution = self.obstacle_map_resolution
+        
+        # Convert to list of lists format expected by parent class (node grid size)
         self.obstacle_map = [[bool(obstacle_map[ix][iy]) for iy in range(self.y_width)]
                              for ix in range(self.x_width)]
     
@@ -560,7 +609,11 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         
         return obstacle_map
     
-    def __init__(self, ox, oy, resolution, rr, distance_field=None, use_distance_cost=True, min_clearance_norm=0.50):
+    def __init__(self, ox, oy, resolution, rr, distance_field=None, use_distance_cost=True, min_clearance_norm=0.50, obstacle_map_resolution=None):
+        # Store obstacle map resolution (for collision detection precision)
+        # If None, use same as node grid resolution
+        self.obstacle_map_resolution = obstacle_map_resolution if obstacle_map_resolution is not None else resolution
+        
         # Temporarily disable animation in parent class
         original_show = a_star.show_animation
         a_star.show_animation = False
@@ -1395,12 +1448,23 @@ class PathFinder:
         # Get obstacles
         ox, oy = self.maze.get_obstacle_list()
         
-        # Get grid resolution from config
+        # Get grid resolution from config (for node grid)
         grid_resolution = cfg.get("grid_resolution", CELL_SIZE)
-        print(f"[A*] Using grid resolution: {grid_resolution} pixels per node")
+        # Get obstacle map resolution from config (for collision detection)
+        obstacle_map_resolution = cfg.get("obstacle_map_resolution", 1.0)
+        
+        print(f"[A*] Node grid resolution: {grid_resolution} pixels per node")
+        print(f"[A*] Obstacle map resolution: {obstacle_map_resolution} pixels per cell (for collision detection)")
+        
         if grid_resolution > 1.0:
             print(f"[A*] Each node represents a {grid_resolution}x{grid_resolution} pixel area")
             print(f"[A*] This reduces search space from ~{len(ox)} to ~{int(len(ox) / (grid_resolution * grid_resolution))} nodes")
+        
+        if obstacle_map_resolution == 1.0:
+            print(f"[A*] ✓ Using full-resolution obstacle map for maximum collision sensitivity")
+        elif obstacle_map_resolution > grid_resolution:
+            print(f"[A*] ⚠ Obstacle map resolution ({obstacle_map_resolution}) > grid resolution ({grid_resolution})")
+            print(f"[A*] This provides high collision sensitivity with reduced search space")
         
         # Get distance field if available
         distance_field = None
@@ -1416,11 +1480,13 @@ class PathFinder:
                 use_distance_cost = False
         
         # Create A* planner with tracking and distance field
-        # Robot radius stays the same in world coordinates, but grid resolution affects search space
-        planner = AStarPlannerWithTracking(ox, oy, grid_resolution, ROBOT_RADIUS, 
+        # grid_resolution: controls node grid size (search space)
+        # obstacle_map_resolution: controls obstacle map precision (collision sensitivity)
+        planner = AStarPlannerWithTracking(ox, oy, grid_resolution, ROBOT_RADIUS,
                                           distance_field=distance_field,
                                           use_distance_cost=use_distance_cost,
-                                          min_clearance_norm=min_clearance_norm)
+                                          min_clearance_norm=min_clearance_norm,
+                                          obstacle_map_resolution=obstacle_map_resolution)
         
         # Find path
         sx, sy = self.maze.start
