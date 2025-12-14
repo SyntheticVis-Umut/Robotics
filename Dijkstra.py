@@ -13,7 +13,7 @@ Features:
 - Dijkstra pathfinding with wall edge leak prevention
 - Catmull-Rom spline path smoothing
 - Collision detection for smoothed paths
-- PNG image maze loading
+- PNG image maze loading with Canny edge detection
 - Visualization of path exploration and final path
 - Static path visualization with explored nodes
 """
@@ -26,7 +26,7 @@ import heapq
 import json
 import random
 import numpy as np
-from PIL import Image
+import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
@@ -90,6 +90,9 @@ def load_planner_config():
         "show_distance_map": True,
         "smoothing_enabled": True,
         "distance_heat_gamma": 1.0,
+        "detection_mode": "canny",
+        "canny_threshold1": 100,
+        "canny_threshold2": 200,
     }
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -111,6 +114,7 @@ class Maze:
         self.width = width
         self.height = height
         self.walls = set()
+        self.canny_edge_map = None  # Store Canny edge detection result as numpy array
         # Start at center by default
         self.start = (width / 2.0, height / 2.0)
         self.exit = (width - 1.5, height - 1.5)  # Slightly offset from walls
@@ -130,15 +134,28 @@ class Maze:
     
     def is_wall(self, x, y):
         """Check if position (x, y) is a wall"""
+        # If Canny edge map is available, use it directly
+        if self.canny_edge_map is not None:
+            if 0 <= int(y) < self.height and 0 <= int(x) < self.width:
+                return self.canny_edge_map[int(y), int(x)] > 0
+        # Otherwise, use traditional walls set
         return (x, y) in self.walls
     
     def get_valid_positions(self):
         """Get all valid (non-wall) positions in the maze"""
-        valid_positions = []
-        for x in range(self.width):
-            for y in range(self.height):
-                if not self.is_wall(x, y):
-                    valid_positions.append((float(x), float(y)))
+        # If Canny edge map is available, use numpy vectorized operations
+        if self.canny_edge_map is not None:
+            # Use numpy to find all free space pixels efficiently
+            free_coords = np.argwhere(self.canny_edge_map == 0)  # Returns (y, x) coordinates
+            # Convert to (x, y) format and convert to list of tuples
+            valid_positions = [(float(x), float(y)) for y, x in free_coords]
+        else:
+            # Traditional method: check walls set
+            valid_positions = []
+            for x in range(self.width):
+                for y in range(self.height):
+                    if not self.is_wall(x, y):
+                        valid_positions.append((float(x), float(y)))
         return valid_positions
     
     def set_random_start_exit(self, min_distance=None):
@@ -188,8 +205,23 @@ class Maze:
     
     def get_obstacle_list(self):
         """Convert walls to obstacle lists for Dijkstra planner"""
-        ox, oy = [], []
-        
+        # If Canny edge map is available, use numpy vectorized operations
+        if self.canny_edge_map is not None:
+            # Use numpy to find all edge pixels efficiently
+            edge_coords = np.argwhere(self.canny_edge_map > 0)  # Returns (y, x) coordinates
+            # Convert to (x, y) format
+            oy, ox = edge_coords[:, 0], edge_coords[:, 1]
+            ox = ox.tolist()
+            oy = oy.tolist()
+            
+            # Add border walls
+            border_x = list(range(self.width)) + list(range(self.width)) + [0] * self.height + [self.width - 1] * self.height
+            border_y = [0] * self.width + [self.height - 1] * self.width + list(range(self.height)) + list(range(self.height))
+            ox.extend(border_x)
+            oy.extend(border_y)
+        else:
+            # Traditional method: build from walls set
+            ox, oy = [], []
         # Add border walls
         for i in range(self.width):
             ox.append(i)
@@ -213,21 +245,38 @@ class Maze:
         """
         Create a 2D boolean array representing obstacles for distance mapping.
         Returns a numpy array where True = obstacle, False = free space.
+        Shape: (width, height) - x, y coordinates
         """
-        obstacle_map = np.zeros((self.width, self.height), dtype=bool)
-        
-        # Add border walls
-        obstacle_map[:, 0] = True  # Top border
-        obstacle_map[:, self.height - 1] = True  # Bottom border
-        obstacle_map[0, :] = True  # Left border
-        obstacle_map[self.width - 1, :] = True  # Right border
-        
-        # Add internal walls
-        for wall_x, wall_y in self.walls:
-            if 0 <= wall_x < self.width and 0 <= wall_y < self.height:
-                obstacle_map[int(wall_x), int(wall_y)] = True
-        
-        return obstacle_map
+        # If Canny edge map is available, use it directly
+        if self.canny_edge_map is not None:
+            # Canny edge map is (height, width) format (y, x)
+            # Convert to boolean: 0 = free space, >0 = edge/obstacle
+            # Transpose to (width, height) format (x, y)
+            obstacle_map = (self.canny_edge_map > 0).T.astype(bool)
+            
+            # Add border walls
+            obstacle_map[:, 0] = True  # Top border
+            obstacle_map[:, self.height - 1] = True  # Bottom border
+            obstacle_map[0, :] = True  # Left border
+            obstacle_map[self.width - 1, :] = True  # Right border
+            
+            return obstacle_map
+        else:
+            # Traditional method: build from walls set
+            obstacle_map = np.zeros((self.width, self.height), dtype=bool)
+            
+            # Add border walls
+            obstacle_map[:, 0] = True  # Top border
+            obstacle_map[:, self.height - 1] = True  # Bottom border
+            obstacle_map[0, :] = True  # Left border
+            obstacle_map[self.width - 1, :] = True  # Right border
+            
+            # Add internal walls
+            for wall_x, wall_y in self.walls:
+                if 0 <= wall_x < self.width and 0 <= wall_y < self.height:
+                    obstacle_map[int(wall_x), int(wall_y)] = True
+            
+            return obstacle_map
     
     def compute_distance_field(self, use_sdf=True):
         """
@@ -252,41 +301,65 @@ class Maze:
             return compute_udf_scipy(obstacles_bool)
     
     @staticmethod
-    def from_image(image_path, start_pos=None, exit_pos=None):
+    def from_image(image_path, start_pos=None, exit_pos=None, detection_mode='canny', canny_threshold1=100, canny_threshold2=200):
         """
-        Create a maze from a PNG image
-        Black pixels (or dark pixels) = walls
-        White pixels (or light pixels) = open paths
+        Create a maze from a PNG image using either Canny edge detection or legacy threshold mode
         
         Args:
             image_path: Path to PNG image
             start_pos: Tuple (x, y) for start position, or None for auto-detection
             exit_pos: Tuple (x, y) for exit position, or None for auto-detection
+            detection_mode: 'canny' for Canny edge detection, 'none' for legacy threshold mode
+            canny_threshold1: Lower threshold for Canny edge detection (default: 100)
+            canny_threshold2: Upper threshold for Canny edge detection (default: 200)
         
         Returns:
             Maze object
         """
-        # Load image
-        img = Image.open(image_path)
-        # Convert to grayscale
-        img_gray = img.convert('L')
-        # Convert to numpy array
-        img_array = np.array(img_gray)
+        # Load image using OpenCV
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        # Flip vertically and horizontally so origin aligns with plot
+        #img = np.flipud(img)   # bottom-to-top
         
-        height, width = img_array.shape
+        if img is None:
+            raise ValueError(f"Could not load image from {image_path}")
+        
+        height, width = img.shape
         
         # Create maze
         maze = Maze(width, height)
         
-        # Threshold: pixels darker than 128 are considered walls
-        threshold = 128
-        
-        # Find walls
-        for y in range(height):
-            for x in range(width):
-                pixel_value = img_array[y, x]
-                if pixel_value < threshold:
-                    maze.add_wall(x, y)
+        if detection_mode == 'canny':
+            # Apply Gaussian blur to reduce noise before edge detection
+            blurred = cv2.GaussianBlur(img, (5, 5), 1.4)
+            
+            # Apply Canny edge detection
+            # Canny output: white pixels (255) = edges, black pixels (0) = non-edges
+            edges = cv2.Canny(blurred, canny_threshold1, canny_threshold2)
+            
+            # Store Canny edge map directly as numpy array
+            # Canny output: white (255) = edges = obstacles, black (0) = free space
+            maze.canny_edge_map = edges
+
+            # Save Canny edge map for reference
+            try:
+                maps_dir = os.path.dirname(image_path)
+                canny_output_path = os.path.join(maps_dir, 'canny.png')
+                cv2.imwrite(canny_output_path, edges)
+                print(f"Canny edge map saved to: {canny_output_path}")
+            except Exception as e:
+                print(f"[Warning] Failed to save Canny edge map: {e}")
+        else:
+            # Legacy mode: black pixels = walls, white pixels = free paths
+            # Convert to binary: threshold at 128 (black < 128 = wall, white >= 128 = free)
+            _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+            # In legacy mode, we convert to walls set
+            for y in range(height):
+                for x in range(width):
+                    if binary[y, x] > 0:  # Wall (originally black pixel)
+                        maze.add_wall(x, y)
+            # No canny_edge_map in legacy mode
+            maze.canny_edge_map = None
         
         # Auto-detect start and exit if not provided
         if start_pos is None or exit_pos is None:
@@ -1017,8 +1090,19 @@ def load_maze_from_maps():
     
     print(f"Loading maze from image: {os.path.basename(image_path)}")
     
+    # Load config to get detection_mode
+    config = load_planner_config()
+    detection_mode = config.get("detection_mode", "canny")
+    canny_threshold1 = config.get("canny_threshold1", 100)
+    canny_threshold2 = config.get("canny_threshold2", 200)
+    
+    print(f"Using detection mode: {detection_mode}")
+    
     try:
-        maze = Maze.from_image(image_path)
+        maze = Maze.from_image(image_path, 
+                              detection_mode=detection_mode,
+                              canny_threshold1=canny_threshold1,
+                              canny_threshold2=canny_threshold2)
         print(f"Successfully loaded maze: {maze.width}x{maze.height}")
         print(f"Start position: {maze.start}")
         print(f"Exit position: {maze.exit}")
