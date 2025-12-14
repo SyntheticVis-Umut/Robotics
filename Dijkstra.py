@@ -93,6 +93,7 @@ def load_planner_config():
         "detection_mode": "canny",
         "canny_threshold1": 100,
         "canny_threshold2": 200,
+        "map_file": None,
     }
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -1081,20 +1082,30 @@ def load_maze_from_maps():
         print(f"No PNG files found in {maps_dir}")
         return None
     
-    # Prefer sophisticated_maze.png if it exists, otherwise use the first PNG file found
-    sophisticated_maze = os.path.join(maps_dir, 'sophisticated_maze.png')
-    if os.path.exists(sophisticated_maze):
-        image_path = sophisticated_maze
-    else:
-        image_path = png_files[0]
-    
-    print(f"Loading maze from image: {os.path.basename(image_path)}")
-    
-    # Load config to get detection_mode
+    # Load config to get detection mode and desired map file
     config = load_planner_config()
     detection_mode = config.get("detection_mode", "canny")
     canny_threshold1 = config.get("canny_threshold1", 100)
     canny_threshold2 = config.get("canny_threshold2", 200)
+    map_file = config.get("map_file")
+    
+    # Choose image: prefer map_file from config if it exists; otherwise prefer sophisticated_maze.png
+    image_path = None
+    if map_file:
+        candidate = os.path.join(maps_dir, map_file)
+        if os.path.exists(candidate):
+            image_path = candidate
+        else:
+            print(f"[Config] map_file '{map_file}' not found in maps/. Falling back to defaults.")
+    
+    if image_path is None:
+        sophisticated_maze = os.path.join(maps_dir, 'sophisticated_maze.png')
+        if os.path.exists(sophisticated_maze):
+            image_path = sophisticated_maze
+        else:
+            image_path = png_files[0]
+    
+    print(f"Loading maze from image: {os.path.basename(image_path)}")
     
     print(f"Using detection mode: {detection_mode}")
     
