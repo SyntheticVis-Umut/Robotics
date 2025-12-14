@@ -730,21 +730,17 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                     dist_values_gpu = None
                     if self.use_distance_cost and self.distance_field_norm_gpu is not None:
                         df_width, df_height = self.distance_field_norm.shape
-                        # Compute distance field coordinates on GPU
-                        df_coords_x = []
-                        df_coords_y = []
-                        for new_x, new_y, new_cost, motion_step in neighbor_nodes:
-                            px = self.calc_grid_position(new_x, self.min_x)
-                            py = self.calc_grid_position(new_y, self.min_y)
-                            maze_x = int(np.clip(px, 0, df_width - 1))
-                            maze_y = int(np.clip(py, 0, df_height - 1))
-                            df_coords_x.append(maze_x)
-                            df_coords_y.append(maze_y)
+                        # Compute distance field coordinates on GPU (all operations on CUDA)
+                        # Convert grid indices to world coordinates on GPU
+                        px_gpu = x_coords.astype(cp.float32) * self.resolution + self.min_x
+                        py_gpu = y_coords.astype(cp.float32) * self.resolution + self.min_y
+                        
+                        # Clip and convert to maze grid indices on GPU
+                        df_x_gpu = cp.clip(px_gpu, 0, df_width - 1).astype(cp.int32)
+                        df_y_gpu = cp.clip(py_gpu, 0, df_height - 1).astype(cp.int32)
                         
                         # Batch distance field lookup on CUDA
-                        df_x = cp.array(df_coords_x, dtype=cp.int32)
-                        df_y = cp.array(df_coords_y, dtype=cp.int32)
-                        dist_values_gpu = self.distance_field_norm_gpu[df_x, df_y]
+                        dist_values_gpu = self.distance_field_norm_gpu[df_x_gpu, df_y_gpu]
                     
                     # Prepare diagonal check data on GPU (all CUDA operations)
                     # Compute deltas for all neighbors on GPU
@@ -845,28 +841,110 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                     if self.verify_node(node, current):
                         valid_neighbors.append((new_x, new_y, new_cost))
             
-            # Process valid neighbors
-            for new_x, new_y, new_cost in valid_neighbors:
-                node = self.Node(new_x, new_y, new_cost, c_id)
-                n_id = self.calc_grid_index(node)
+            # Process valid neighbors - compute everything on GPU if available
+            if self.use_gpu and GPU_AVAILABLE and GPU_USABLE and len(valid_neighbors) > 0:
+                try:
+                    # Batch compute all values on GPU
+                    n_valid = len(valid_neighbors)
+                    valid_x_gpu = cp.array([vn[0] for vn in valid_neighbors], dtype=cp.int32)
+                    valid_y_gpu = cp.array([vn[1] for vn in valid_neighbors], dtype=cp.int32)
+                    valid_cost_gpu = cp.array([vn[2] for vn in valid_neighbors], dtype=cp.float32)
+                    
+                    # Compute grid indices on GPU
+                    # grid_index = y * x_width + x
+                    grid_indices_gpu = valid_y_gpu * self.x_width + valid_x_gpu
+                    
+                    # Compute grid positions (world coordinates) on GPU
+                    grid_pos_x_gpu = valid_x_gpu.astype(cp.float32) * self.resolution + self.min_x
+                    grid_pos_y_gpu = valid_y_gpu.astype(cp.float32) * self.resolution + self.min_y
+                    
+                    # Compute goal position on GPU
+                    goal_x_gpu = cp.array([goal_node.x] * n_valid, dtype=cp.int32)
+                    goal_y_gpu = cp.array([goal_node.y] * n_valid, dtype=cp.int32)
+                    goal_pos_x_gpu = goal_x_gpu.astype(cp.float32) * self.resolution + self.min_x
+                    goal_pos_y_gpu = goal_y_gpu.astype(cp.float32) * self.resolution + self.min_y
+                    
+                    # Compute heuristics on GPU (Euclidean distance)
+                    dx_gpu = grid_pos_x_gpu - goal_pos_x_gpu
+                    dy_gpu = grid_pos_y_gpu - goal_pos_y_gpu
+                    h_cost_gpu = cp.sqrt(dx_gpu * dx_gpu + dy_gpu * dy_gpu)
+                    
+                    # Compute f_cost on GPU
+                    f_cost_gpu = valid_cost_gpu + h_cost_gpu
+                    
+                    # Transfer results to CPU in one batch
+                    grid_indices_cpu = cp.asnumpy(grid_indices_gpu).astype(int)
+                    f_cost_cpu = cp.asnumpy(f_cost_gpu)
+                    h_cost_cpu = cp.asnumpy(h_cost_gpu)
+                    valid_cost_cpu = cp.asnumpy(valid_cost_gpu)
+                    
+                    # Process each neighbor with GPU-computed values
+                    for idx, (new_x, new_y, new_cost) in enumerate(valid_neighbors):
+                        n_id = int(grid_indices_cpu[idx])
+                        
+                        if n_id in closed_set:
+                            continue
+                        
+                        node = self.Node(new_x, new_y, valid_cost_cpu[idx], c_id)
+                        f_cost = float(f_cost_cpu[idx])
+                        
+                        if n_id not in open_set_dict:
+                            # New node discovered
+                            open_set_dict[n_id] = node
+                            heapq.heappush(open_heap, (f_cost, valid_cost_cpu[idx], n_id, node))
+                        else:
+                            # Update if we found a better path
+                            existing_node = open_set_dict[n_id]
+                            if existing_node.cost > valid_cost_cpu[idx]:
+                                open_set_dict[n_id] = node
+                                heapq.heappush(open_heap, (f_cost, valid_cost_cpu[idx], n_id, node))
+                                
+                except Exception as e:
+                    # Fallback to CPU computation
+                    for new_x, new_y, new_cost in valid_neighbors:
+                        node = self.Node(new_x, new_y, new_cost, c_id)
+                        n_id = self.calc_grid_index(node)
 
-                if n_id in closed_set:
-                    continue
+                        if n_id in closed_set:
+                            continue
 
-                # Calculate heuristic and f_cost
-                h_cost = self.calc_heuristic(goal_node, node)
-                f_cost = new_cost + h_cost
+                        # Calculate heuristic and f_cost
+                        h_cost = self.calc_heuristic(goal_node, node)
+                        f_cost = new_cost + h_cost
 
-                if n_id not in open_set_dict:
-                    # New node discovered
-                    open_set_dict[n_id] = node
-                    heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
-                else:
-                    # Update if we found a better path
-                    existing_node = open_set_dict[n_id]
-                    if existing_node.cost > new_cost:
+                        if n_id not in open_set_dict:
+                            # New node discovered
+                            open_set_dict[n_id] = node
+                            heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
+                        else:
+                            # Update if we found a better path
+                            existing_node = open_set_dict[n_id]
+                            if existing_node.cost > new_cost:
+                                open_set_dict[n_id] = node
+                                heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
+            else:
+                # CPU path: compute individually
+                for new_x, new_y, new_cost in valid_neighbors:
+                    node = self.Node(new_x, new_y, new_cost, c_id)
+                    n_id = self.calc_grid_index(node)
+
+                    if n_id in closed_set:
+                        continue
+
+                    # Calculate heuristic and f_cost
+                    h_cost = self.calc_heuristic(goal_node, node)
+                    f_cost = new_cost + h_cost
+
+                    if n_id not in open_set_dict:
+                        # New node discovered
                         open_set_dict[n_id] = node
                         heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
+                    else:
+                        # Update if we found a better path
+                        existing_node = open_set_dict[n_id]
+                        if existing_node.cost > new_cost:
+                            open_set_dict[n_id] = node
+                            heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
 
         rx, ry = self.calc_final_path(goal_node, closed_set)
 
