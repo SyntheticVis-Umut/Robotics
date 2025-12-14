@@ -25,6 +25,7 @@ import math
 import glob
 import heapq
 import json
+import random
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -132,6 +133,60 @@ class Maze:
         """Check if position (x, y) is a wall"""
         return (x, y) in self.walls
     
+    def get_valid_positions(self):
+        """Get all valid (non-wall) positions in the maze"""
+        valid_positions = []
+        for x in range(self.width):
+            for y in range(self.height):
+                if not self.is_wall(x, y):
+                    valid_positions.append((float(x), float(y)))
+        return valid_positions
+    
+    def set_random_start_exit(self, min_distance=None):
+        """
+        Set random start and exit positions from valid positions.
+        
+        Args:
+            min_distance: Minimum distance between start and exit (optional)
+        """
+        valid_positions = self.get_valid_positions()
+        
+        if len(valid_positions) < 2:
+            # Fallback to default positions if not enough valid positions
+            self.start = (1.0, 1.0)
+            self.exit = (float(self.width - 1), float(self.height - 1))
+            return
+        
+        # Try to find positions that are far apart
+        max_attempts = 100
+        for attempt in range(max_attempts):
+            start_pos = random.choice(valid_positions)
+            exit_pos = random.choice(valid_positions)
+            
+            # Make sure they're different
+            if start_pos == exit_pos:
+                continue
+            
+            # Check minimum distance if specified
+            if min_distance is not None:
+                dx = start_pos[0] - exit_pos[0]
+                dy = start_pos[1] - exit_pos[1]
+                distance = math.sqrt(dx*dx + dy*dy)
+                if distance < min_distance:
+                    continue
+            
+            self.start = start_pos
+            self.exit = exit_pos
+            return
+        
+        # Fallback: just pick any two different positions
+        if len(valid_positions) >= 2:
+            self.start = valid_positions[0]
+            self.exit = valid_positions[-1]
+        else:
+            self.start = (1.0, 1.0)
+            self.exit = (float(self.width - 1), float(self.height - 1))
+    
     def get_obstacle_list(self):
         """Convert walls to obstacle lists for A* planner"""
         ox, oy = [], []
@@ -235,64 +290,14 @@ class Maze:
                     maze.add_wall(x, y)
         
         # Auto-detect start and exit if not provided
-        if start_pos is None:
-            # Place start at the center of the maze
-            center_x = width // 2
-            center_y = height // 2
-            
-            # Check if center is a valid (non-wall) position
-            if center_x < width and center_y < height and img_array[center_y, center_x] >= threshold:
-                maze.start = (float(center_x), float(center_y))
-            else:
-                # Center is a wall, find nearest valid position
-                found_start = False
-                max_search_radius = min(width, height) // 2
-                
-                for radius in range(1, max_search_radius + 1):
-                    for dy in range(-radius, radius + 1):
-                        for dx in range(-radius, radius + 1):
-                            if abs(dx) == radius or abs(dy) == radius:
-                                x = center_x + dx
-                                y = center_y + dy
-                                
-                                if 0 <= x < width and 0 <= y < height:
-                                    if img_array[y, x] >= threshold:
-                                        maze.start = (float(x), float(y))
-                                        found_start = True
-                                        break
-                        if found_start:
-                            break
-                    if found_start:
-                        break
-                
-                if not found_start:
-                    for y in range(height):
-                        for x in range(width):
-                            if img_array[y, x] >= threshold:
-                                maze.start = (float(x), float(y))
-                                found_start = True
-                                break
-                        if found_start:
-                            break
-                    if not found_start:
-                        maze.start = (1.0, 1.0)
+        if start_pos is None or exit_pos is None:
+            # Set random start and exit positions
+            # Calculate minimum distance as 30% of maze diagonal
+            diagonal = math.sqrt(width*width + height*height)
+            min_distance = diagonal * 0.3
+            maze.set_random_start_exit(min_distance=min_distance)
         else:
             maze.start = start_pos
-        
-        if exit_pos is None:
-            # Find last white pixel from bottom-right (scanning right to left, bottom to top)
-            found_exit = False
-            for y in range(height - 1, -1, -1):
-                for x in range(width - 1, -1, -1):
-                    if img_array[y, x] >= threshold:
-                        maze.exit = (float(x), float(y))
-                        found_exit = True
-                        break
-                if found_exit:
-                    break
-            if not found_exit:
-                maze.exit = (float(width - 1), float(height - 1))
-        else:
             maze.exit = exit_pos
         
         return maze
@@ -301,8 +306,6 @@ class Maze:
 def create_maze():
     """Create a simple maze with guaranteed path from start to exit"""
     maze = Maze(MAZE_WIDTH, MAZE_HEIGHT)
-    # Set start to center
-    maze.start = (MAZE_WIDTH / 2.0, MAZE_HEIGHT / 2.0)
     
     # Create a simpler maze with a clear winding path
     # We'll create walls but ensure there's always a path
@@ -356,6 +359,11 @@ def create_maze():
     maze.add_wall_line(6, 15, 2, horizontal=False)  # Gap at y=17-18
     maze.add_wall_line(11, 15, 2, horizontal=False)  # Gap at y=17-18
     maze.add_wall_line(16, 15, 2, horizontal=False)  # Gap at y=17-18
+    
+    # Set random start and exit positions
+    diagonal = math.sqrt(MAZE_WIDTH*MAZE_WIDTH + MAZE_HEIGHT*MAZE_HEIGHT)
+    min_distance = diagonal * 0.3
+    maze.set_random_start_exit(min_distance=min_distance)
     
     return maze
 
@@ -824,10 +832,10 @@ class MazeGame:
         self.creature = Creature(self.maze)
         self.fig, self.ax = plt.subplots(figsize=(12, 12))
         self.animation = None
+        self.phase = 'moving'  # Skip exploration, show path immediately
         self.frame_count = 0
         self.show_distance_map = show_distance_map
         self.distance_field = None
-        self.valid_nodes = []  # Pre-computed valid nodes based on distance field
         self._colorbar_added = False
         
         # Compute distance field if enabled
@@ -836,9 +844,6 @@ class MazeGame:
                 print("[Distance Map] Computing distance field...")
                 self.distance_field = self.maze.compute_distance_field(use_sdf=False)  # Use UDF for visualization
                 print("[Distance Map] ✓ Distance field computed successfully")
-                
-                # Pre-compute valid nodes based on distance field
-                self._compute_valid_nodes()
             except Exception as e:
                 print(f"[Distance Map] ✗ Failed to compute distance field: {e}")
                 self.show_distance_map = False
@@ -897,43 +902,8 @@ class MazeGame:
         # Add label only once
         if rectangles:
             rectangles[0].set_label('Walls')
-    
-    def _compute_valid_nodes(self):
-        """
-        Pre-compute all valid nodes based on distance field and distance_heat_gamma.
-        Valid nodes are those that meet the minimum clearance requirement.
-        """
-        if self.distance_field is None:
-            self.valid_nodes = []
-            return
         
-        cfg = load_planner_config()
-        gamma = cfg.get("distance_heat_gamma", 1.0)
-        min_clearance_norm = max(0.05, min(0.95, gamma))
-        
-        # Normalize distance field
-        df = self.distance_field
-        df_norm = (df - df.min()) / (df.max() - df.min() + 1e-8)
-        
-        # Get obstacle map to exclude walls
-        obstacle_map = self.maze.get_obstacle_map_2d()
-        
-        # Find all valid nodes (not walls and above clearance threshold)
-        valid_nodes = []
-        for x in range(self.maze.width):
-            for y in range(self.maze.height):
-                # Skip walls
-                if obstacle_map[x, y]:
-                    continue
-                
-                # Check clearance
-                if df_norm[x, y] >= min_clearance_norm:
-                    valid_nodes.append((float(x), float(y)))
-        
-        self.valid_nodes = valid_nodes
-        print(f"[Valid Nodes] Pre-computed {len(self.valid_nodes)} valid nodes (clearance >= {min_clearance_norm:.3f})")
-        
-    def draw_maze(self, show_exploration=False):
+    def draw_maze(self, show_exploration=True):
         """Draw the maze"""
         self.ax.clear()
         self.ax.set_xlim(-0.5, self.maze.width - 0.5)
@@ -966,13 +936,6 @@ class MazeGame:
         # Draw walls as continuous rectangles
         self._draw_walls_as_rectangles()
         
-        # Draw all valid nodes at once (pre-computed based on distance field)
-        if self.valid_nodes and self.show_distance_map:
-            valid_x = [p[0] for p in self.valid_nodes]
-            valid_y = [p[1] for p in self.valid_nodes]
-            self.ax.scatter(valid_x, valid_y, c='lightgreen', s=8, 
-                           alpha=0.4, marker='o', zorder=1, label='Valid Search Space')
-        
         # Draw start position (bold circle)
         sx, sy = self.maze.start
         self.ax.scatter(sx, sy, c='green', s=280, marker='o',
@@ -983,13 +946,44 @@ class MazeGame:
         self.ax.scatter(ex, ey, c='red', s=320, marker='o',
                        edgecolors='black', linewidths=2.5, zorder=5)
         
-        # Draw final path (always show if found, since valid nodes are already drawn)
+        # Draw all explored nodes (always show when path is found)
+        if self.creature.found_path and self.creature.explored_nodes:
+            explored = self.creature.explored_nodes
+            ex_x = [p[0] for p in explored]
+            ex_y = [p[1] for p in explored]
+            self.ax.scatter(ex_x, ex_y, c='lightblue', s=30, 
+                           alpha=0.6, marker='o', label='Explored Nodes', zorder=2)
+        
+        # Draw all open set nodes from the final state (always show when path is found)
+        if self.creature.found_path and self.creature.open_set_history:
+            # Get the final open set (last non-empty one)
+            final_open_set = None
+            for open_set in reversed(self.creature.open_set_history):
+                if open_set:
+                    final_open_set = open_set
+                    break
+            
+            if final_open_set:
+                open_x = [p[0] for p in final_open_set]
+                open_y = [p[1] for p in final_open_set]
+                self.ax.scatter(open_x, open_y, c='yellow', s=50, 
+                               alpha=0.7, marker='*', label='Open Set', zorder=3)
+        
+        # Draw final path (always show when found)
         if self.creature.found_path and self.creature.current_path:
+            # Draw original A* path (if different from smoothed path)
+            if hasattr(self.creature, 'original_path') and self.creature.original_path:
+                if len(self.creature.original_path) != len(self.creature.current_path):
+                    orig_x = [p[0] for p in self.creature.original_path]
+                    orig_y = [p[1] for p in self.creature.original_path]
+                    self.ax.plot(orig_x, orig_y, 'g--', linewidth=2, alpha=0.4, 
+                               label='A* Path (Original)', zorder=3)
+            
             # Draw smoothed spline path
             path_x = [p[0] for p in self.creature.current_path]
             path_y = [p[1] for p in self.creature.current_path]
-            self.ax.plot(path_x, path_y, 'b-', linewidth=3, alpha=0.9, 
-                        label='Shortest Path', zorder=4)
+            self.ax.plot(path_x, path_y, 'b-', linewidth=3, alpha=0.8, 
+                        label='Smooth Path (Catmull-Rom)', zorder=4)
         
         # Draw creature as simple circle
         cx, cy = self.creature.get_current_position()
@@ -998,7 +992,7 @@ class MazeGame:
         
         # Update title
         if self.creature.found_path:
-            title = f'Maze Game - A* Pathfinding with Catmull-Rom Spline (Path Found: {len(self.creature.current_path)} points)'
+            title = f'Maze Game - A* Pathfinding with Catmull-Rom Spline (Path Found: {len(self.creature.current_path)} steps)'
         else:
             title = f'Maze Game - A* Pathfinding with Catmull-Rom Spline'
         self.ax.set_title(title, fontsize=16, fontweight='bold')
@@ -1007,10 +1001,10 @@ class MazeGame:
         self.ax.set_ylabel('Y Position')
     
     def animate(self, frame):
-        """Animation function - simplified to only show creature movement"""
+        """Animation function - show creature moving along path"""
         self.frame_count = frame
         
-        # Show creature moving along path
+        # Show creature moving along path (path is already drawn)
         self.draw_maze(show_exploration=False)
         if self.creature.path_index < len(self.creature.current_path) - 1:
             if frame % 3 == 0:  # Move every 3 frames
@@ -1029,14 +1023,14 @@ class MazeGame:
             plt.show()
             return
         
-        print(f"Path found! Path length: {len(self.creature.current_path)} points")
+        print(f"Path found! Path length: {len(self.creature.current_path)} steps")
         print(f"Explored {len(self.creature.explored_nodes)} nodes")
         print("Displaying visualization...")
         
-        # Draw the maze with path immediately (no exploration animation)
+        # Draw the maze with path immediately
         self.draw_maze(show_exploration=False)
         
-        # Optionally show creature movement animation
+        # Create animation for creature movement only
         movement_frames = len(self.creature.current_path) * 3 + 20
         self.animation = FuncAnimation(self.fig, self.animate, frames=movement_frames,
                                       interval=50, repeat=True, blit=False)
