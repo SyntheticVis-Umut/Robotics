@@ -698,50 +698,157 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
             closed_set[c_id] = current
 
             # Expand grid search based on motion model
-            # Vectorized expansion for better performance
+            # Batch verify neighbors on GPU for better performance
+            neighbor_nodes = []
+            neighbor_coords = []
+            
             for i, motion_step in enumerate(self.motion):
                 new_x = current.x + motion_step[0]
                 new_y = current.y + motion_step[1]
                 new_cost = current.cost + motion_step[2]
                 
-                # Add clearance check based on distance field (if enabled)
-                if self.use_distance_cost and self.distance_field_norm is not None:
-                    # Get position in world coordinates
-                    px = self.calc_grid_position(new_x, self.min_x)
-                    py = self.calc_grid_position(new_y, self.min_y)
-                    
-                    # Map world coordinates to distance field grid indices
-                    # Distance field is computed on maze grid (0 to width, 0 to height)
-                    # We need to map planner's world coordinates to maze grid
-                    df_width, df_height = self.distance_field_norm.shape
-                    
-                    # Convert world coordinates to maze grid indices
-                    # Assuming maze grid starts at (0, 0) and matches distance field
-                    maze_x = int(np.clip(px, 0, df_width - 1))
-                    maze_y = int(np.clip(py, 0, df_height - 1))
-                    
-                    # Get normalized distance (0 = at wall, 1 = far from wall)
-                    if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
-                        # Use GPU if available, otherwise CPU
-                        if self.use_gpu and self.distance_field_norm_gpu is not None:
-                            try:
-                                dist_value = self.distance_field_norm_gpu[maze_x, maze_y].item()
-                            except Exception:
-                                # Fallback to CPU
-                                dist_value = self.distance_field_norm[maze_x, maze_y]
-                        else:
-                            dist_value = self.distance_field_norm[maze_x, maze_y]
-                        
-                        # Hard clearance cutoff: skip nodes below threshold
-                        if dist_value < self.min_clearance_norm:
-                            continue
+                # Bounds check
+                if new_x < 0 or new_x >= self.x_width or new_y < 0 or new_y >= self.y_width:
+                    continue
                 
+                neighbor_nodes.append((new_x, new_y, new_cost, motion_step))
+                neighbor_coords.append((new_x, new_y))
+            
+            # Batch verify all neighbors on GPU using CUDA
+            valid_neighbors = []
+            if self.use_gpu and GPU_AVAILABLE and GPU_USABLE and len(neighbor_coords) > 0:
+                try:
+                    # Prepare all data on GPU (CUDA) - minimize CPU-GPU transfers
+                    n_neighbors = len(neighbor_coords)
+                    x_coords = cp.array([nc[0] for nc in neighbor_coords], dtype=cp.int32)
+                    y_coords = cp.array([nc[1] for nc in neighbor_coords], dtype=cp.int32)
+                    
+                    # Vectorized obstacle check on CUDA (all operations stay on GPU)
+                    obstacles_gpu = self.obstacle_map_gpu[x_coords, y_coords]
+                    
+                    # Prepare distance field coordinates on GPU if needed
+                    dist_values_gpu = None
+                    if self.use_distance_cost and self.distance_field_norm_gpu is not None:
+                        df_width, df_height = self.distance_field_norm.shape
+                        # Compute distance field coordinates on GPU
+                        df_coords_x = []
+                        df_coords_y = []
+                        for new_x, new_y, new_cost, motion_step in neighbor_nodes:
+                            px = self.calc_grid_position(new_x, self.min_x)
+                            py = self.calc_grid_position(new_y, self.min_y)
+                            maze_x = int(np.clip(px, 0, df_width - 1))
+                            maze_y = int(np.clip(py, 0, df_height - 1))
+                            df_coords_x.append(maze_x)
+                            df_coords_y.append(maze_y)
+                        
+                        # Batch distance field lookup on CUDA
+                        df_x = cp.array(df_coords_x, dtype=cp.int32)
+                        df_y = cp.array(df_coords_y, dtype=cp.int32)
+                        dist_values_gpu = self.distance_field_norm_gpu[df_x, df_y]
+                    
+                    # Prepare diagonal check data on GPU (all CUDA operations)
+                    # Compute deltas for all neighbors on GPU
+                    current_x_gpu = cp.array([current.x] * n_neighbors, dtype=cp.int32)
+                    current_y_gpu = cp.array([current.y] * n_neighbors, dtype=cp.int32)
+                    dx_gpu = x_coords - current_x_gpu
+                    dy_gpu = y_coords - current_y_gpu
+                    
+                    # Identify diagonal moves on GPU (dx != 0 AND dy != 0)
+                    is_diagonal = (dx_gpu != 0) & (dy_gpu != 0)
+                    
+                    # For diagonal moves, compute adjacent cell coordinates on GPU
+                    adj1_x_gpu = current_x_gpu + dx_gpu
+                    adj1_y_gpu = current_y_gpu
+                    adj2_x_gpu = current_x_gpu
+                    adj2_y_gpu = current_y_gpu + dy_gpu
+                    
+                    # Check bounds on GPU
+                    adj1_valid = (adj1_x_gpu >= 0) & (adj1_x_gpu < self.x_width) & \
+                                 (adj1_y_gpu >= 0) & (adj1_y_gpu < self.y_width)
+                    adj2_valid = (adj2_x_gpu >= 0) & (adj2_x_gpu < self.x_width) & \
+                                 (adj2_y_gpu >= 0) & (adj2_y_gpu < self.y_width)
+                    
+                    # Initialize obstacle arrays on GPU
+                    adj1_obstacles = cp.zeros(n_neighbors, dtype=cp.bool_)
+                    adj2_obstacles = cp.zeros(n_neighbors, dtype=cp.bool_)
+                    
+                    # Batch check adjacent cells on GPU using vectorized operations
+                    # Use conditional indexing: only check where valid
+                    valid_adj1_indices = cp.where(adj1_valid)[0]
+                    valid_adj2_indices = cp.where(adj2_valid)[0]
+                    
+                    if len(valid_adj1_indices) > 0:
+                        adj1_x_valid = adj1_x_gpu[valid_adj1_indices]
+                        adj1_y_valid = adj1_y_gpu[valid_adj1_indices]
+                        adj1_obstacles[valid_adj1_indices] = self.obstacle_map_gpu[adj1_x_valid, adj1_y_valid]
+                    
+                    if len(valid_adj2_indices) > 0:
+                        adj2_x_valid = adj2_x_gpu[valid_adj2_indices]
+                        adj2_y_valid = adj2_y_gpu[valid_adj2_indices]
+                        adj2_obstacles[valid_adj2_indices] = self.obstacle_map_gpu[adj2_x_valid, adj2_y_valid]
+                    
+                    # Combine all checks on GPU using vectorized CUDA operations
+                    # Valid if: not obstacle AND (distance OK) AND (not diagonal OR diagonal corners OK)
+                    valid_mask = ~obstacles_gpu  # Not an obstacle
+                    
+                    # Apply distance field check if enabled (all on GPU)
+                    if dist_values_gpu is not None:
+                        valid_mask = valid_mask & (dist_values_gpu >= self.min_clearance_norm)
+                    
+                    # Apply diagonal corner check (all on GPU)
+                    # For diagonal moves, both adjacent cells must be free
+                    diagonal_corner_blocked = is_diagonal & (adj1_obstacles | adj2_obstacles)
+                    valid_mask = valid_mask & ~diagonal_corner_blocked
+                    
+                    # Single GPU-to-CPU transfer at the end (minimize transfers)
+                    valid_mask_cpu = cp.asnumpy(valid_mask)
+                    
+                    # Extract valid neighbors
+                    for idx, (new_x, new_y, new_cost, motion_step) in enumerate(neighbor_nodes):
+                        if valid_mask_cpu[idx]:
+                            valid_neighbors.append((new_x, new_y, new_cost))
+                        
+                except Exception as e:
+                    # Fallback to individual checks if batch fails
+                    for new_x, new_y, new_cost, motion_step in neighbor_nodes:
+                        node = self.Node(new_x, new_y, new_cost, c_id)
+                        if self.verify_node(node, current):
+                            # Distance field check
+                            if self.use_distance_cost and self.distance_field_norm is not None:
+                                px = self.calc_grid_position(new_x, self.min_x)
+                                py = self.calc_grid_position(new_y, self.min_y)
+                                df_width, df_height = self.distance_field_norm.shape
+                                maze_x = int(np.clip(px, 0, df_width - 1))
+                                maze_y = int(np.clip(py, 0, df_height - 1))
+                                if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
+                                    dist_value = self.distance_field_norm[maze_x, maze_y]
+                                    if dist_value < self.min_clearance_norm:
+                                        continue
+                            valid_neighbors.append((new_x, new_y, new_cost))
+            else:
+                # CPU path: verify neighbors individually
+                for new_x, new_y, new_cost, motion_step in neighbor_nodes:
+                    node = self.Node(new_x, new_y, new_cost, c_id)
+                    
+                    # Add clearance check based on distance field (if enabled)
+                    if self.use_distance_cost and self.distance_field_norm is not None:
+                        px = self.calc_grid_position(new_x, self.min_x)
+                        py = self.calc_grid_position(new_y, self.min_y)
+                        df_width, df_height = self.distance_field_norm.shape
+                        maze_x = int(np.clip(px, 0, df_width - 1))
+                        maze_y = int(np.clip(py, 0, df_height - 1))
+                        if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
+                            dist_value = self.distance_field_norm[maze_x, maze_y]
+                            if dist_value < self.min_clearance_norm:
+                                continue
+                    
+                    if self.verify_node(node, current):
+                        valid_neighbors.append((new_x, new_y, new_cost))
+            
+            # Process valid neighbors
+            for new_x, new_y, new_cost in valid_neighbors:
                 node = self.Node(new_x, new_y, new_cost, c_id)
                 n_id = self.calc_grid_index(node)
-
-                # Fast verification
-                if not self.verify_node(node, current):
-                    continue
 
                 if n_id in closed_set:
                     continue
