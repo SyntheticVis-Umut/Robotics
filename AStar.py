@@ -443,6 +443,91 @@ def create_maze():
 class AStarPlannerWithTracking(a_star.AStarPlanner):
     """Optimized A* planner with GPU support, tracking, wall edge leak prevention, and distance field cost"""
     
+    def calc_obstacle_map(self, ox, oy):
+        """
+        Optimized obstacle map calculation using vectorized operations.
+        Much faster than the original triple-nested loop, especially for large maps.
+        Uses GPU if available, otherwise vectorized CPU operations.
+        """
+        self.min_x = round(min(ox))
+        self.min_y = round(min(oy))
+        self.max_x = round(max(ox))
+        self.max_y = round(max(oy))
+        print("min_x:", self.min_x)
+        print("min_y:", self.min_y)
+        print("max_x:", self.max_x)
+        print("max_y:", self.max_y)
+
+        self.x_width = round((self.max_x - self.min_x) / self.resolution)
+        self.y_width = round((self.max_y - self.min_y) / self.resolution)
+        print("x_width:", self.x_width)
+        print("y_width:", self.y_width)
+
+        # Use vectorized operations for much faster obstacle map generation
+        # Create grid coordinates
+        x_coords = np.arange(self.x_width) * self.resolution + self.min_x
+        y_coords = np.arange(self.y_width) * self.resolution + self.min_y
+        
+        # Create meshgrid for all grid points
+        X, Y = np.meshgrid(x_coords, y_coords, indexing='ij')
+        
+        # Convert obstacle points to numpy array
+        ox_array = np.array(ox)
+        oy_array = np.array(oy)
+        
+        # Use GPU if available for distance calculations
+        if GPU_AVAILABLE and GPU_USABLE:
+            try:
+                print("[GPU] Computing obstacle map on GPU...")
+                # Transfer to GPU
+                X_gpu = cp.asarray(X)
+                Y_gpu = cp.asarray(Y)
+                ox_gpu = cp.asarray(ox_array)
+                oy_gpu = cp.asarray(oy_array)
+                rr_gpu = cp.float32(self.rr)
+                
+                # Compute distances using broadcasting on GPU
+                # Shape: (x_width, y_width, num_obstacles)
+                dx = X_gpu[:, :, cp.newaxis] - ox_gpu[cp.newaxis, cp.newaxis, :]
+                dy = Y_gpu[:, :, cp.newaxis] - oy_gpu[cp.newaxis, cp.newaxis, :]
+                distances = cp.sqrt(dx * dx + dy * dy)
+                
+                # Check if any obstacle is within robot radius
+                # Shape: (x_width, y_width)
+                obstacle_map_gpu = cp.any(distances <= rr_gpu, axis=2)
+                
+                # Transfer back to CPU
+                obstacle_map = cp.asnumpy(obstacle_map_gpu)
+                print("[GPU] ✓ Obstacle map computed on GPU")
+            except Exception as e:
+                print(f"[GPU] ⚠ GPU computation failed: {e}, using CPU")
+                # Fallback to CPU vectorized
+                obstacle_map = self._calc_obstacle_map_cpu_vectorized(X, Y, ox_array, oy_array)
+        else:
+            # Use CPU vectorized operations
+            obstacle_map = self._calc_obstacle_map_cpu_vectorized(X, Y, ox_array, oy_array)
+        
+        # Convert to list of lists format expected by parent class
+        self.obstacle_map = [[bool(obstacle_map[ix][iy]) for iy in range(self.y_width)]
+                             for ix in range(self.x_width)]
+    
+    def _calc_obstacle_map_cpu_vectorized(self, X, Y, ox_array, oy_array):
+        """
+        CPU-optimized obstacle map using vectorized NumPy operations.
+        Uses broadcasting to compute all distances at once.
+        """
+        # Compute distances using broadcasting
+        # Shape: (x_width, y_width, num_obstacles)
+        dx = X[:, :, np.newaxis] - ox_array[np.newaxis, np.newaxis, :]
+        dy = Y[:, :, np.newaxis] - oy_array[np.newaxis, np.newaxis, :]
+        distances = np.sqrt(dx * dx + dy * dy)
+        
+        # Check if any obstacle is within robot radius
+        # Shape: (x_width, y_width)
+        obstacle_map = np.any(distances <= self.rr, axis=2)
+        
+        return obstacle_map
+    
     def __init__(self, ox, oy, resolution, rr, distance_field=None, use_distance_cost=True, min_clearance_norm=0.50):
         # Temporarily disable animation in parent class
         original_show = a_star.show_animation
@@ -506,6 +591,23 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         self.obstacle_map_np = np.array(self.obstacle_map, dtype=bool)
         if not self.use_gpu:
             print("[CPU] ✓ Using optimized CPU (NumPy) for obstacle map")
+    
+    def _calc_obstacle_map_cpu_vectorized(self, X, Y, ox_array, oy_array):
+        """
+        CPU-optimized obstacle map using vectorized NumPy operations.
+        Uses broadcasting to compute all distances at once.
+        """
+        # Compute distances using broadcasting
+        # Shape: (x_width, y_width, num_obstacles)
+        dx = X[:, :, np.newaxis] - ox_array[np.newaxis, np.newaxis, :]
+        dy = Y[:, :, np.newaxis] - oy_array[np.newaxis, np.newaxis, :]
+        distances = np.sqrt(dx * dx + dy * dy)
+        
+        # Check if any obstacle is within robot radius
+        # Shape: (x_width, y_width)
+        obstacle_map = np.any(distances <= self.rr, axis=2)
+        
+        return obstacle_map
     
     @staticmethod
     @jit(nopython=True, cache=True)
