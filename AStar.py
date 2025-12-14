@@ -529,8 +529,8 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                     # Shape: (obstacle_x_width, obstacle_y_width, batch_size)
                     dx = X_obstacle_gpu[:, :, cp.newaxis] - ox_batch_gpu[cp.newaxis, cp.newaxis, :]
                     dy = Y_obstacle_gpu[:, :, cp.newaxis] - oy_batch_gpu[cp.newaxis, cp.newaxis, :]
-                distances = cp.sqrt(dx * dx + dy * dy)
-                
+                    distances = cp.sqrt(dx * dx + dy * dy)
+                    
                     # Check if any obstacle in this batch is within robot radius
                     # Shape: (obstacle_x_width, obstacle_y_width)
                     batch_obstacle_map = cp.any(distances <= rr_gpu, axis=2)
@@ -584,9 +584,9 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
             node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
             obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
         
-        # Delete full-resolution obstacle map after sampling (no longer needed)
-        # This saves ~286 KB of memory for a 468×612 map
-        del obstacle_map_full
+        # Store full-resolution obstacle map for later use
+        self.obstacle_map_full = obstacle_map_full
+        self.obstacle_map_full_resolution = self.obstacle_map_resolution
         
         # Convert to list of lists format expected by parent class (node grid size)
         self.obstacle_map = [[bool(obstacle_map[ix][iy]) for iy in range(self.y_width)]
@@ -876,7 +876,7 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                                 del open_set_dict[c_id]
                             else:
                                 # Node was updated, skip it
-                continue
+                                continue
                         else:
                             # f_cost too different, put it back
                             heapq.heappush(open_heap, (f_cost, g_cost, c_id, node))
@@ -892,35 +892,35 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                     if c_id in open_set_dict and open_set_dict[c_id] == node:
                         batch_nodes.append((f_cost, g_cost, c_id, node))
                         batch_f_costs.append(f_cost)
-            del open_set_dict[c_id]
+                        del open_set_dict[c_id]
             
             if len(batch_nodes) == 0:
                 continue
             
             # Process batch of nodes
             for f_cost, g_cost, c_id, current in batch_nodes:
-            # Track explored nodes
-            explored_pos = (self.calc_grid_position(current.x, self.min_x),
-                           self.calc_grid_position(current.y, self.min_y))
-            self.explored_nodes.append(explored_pos)
+                # Track explored nodes
+                explored_pos = (self.calc_grid_position(current.x, self.min_x),
+                               self.calc_grid_position(current.y, self.min_y))
+                self.explored_nodes.append(explored_pos)
                 nodes_processed += 1
                 
                 # Check for goal
-            if current.x == goal_node.x and current.y == goal_node.y:
-                print(f"[A*] ✓ Goal found! Explored {len(self.explored_nodes)} nodes")
-                if self.use_gpu:
-                    print("[A*] Pathfinding completed using GPU acceleration")
-                elif NUMBA_AVAILABLE:
-                    print("[A*] Pathfinding completed using CPU with Numba JIT")
-                else:
-                    print("[A*] Pathfinding completed using optimized CPU")
-                goal_node.parent_index = current.parent_index
-                goal_node.cost = current.cost
-                break
-
+                if current.x == goal_node.x and current.y == goal_node.y:
+                    print(f"[A*] ✓ Goal found! Explored {len(self.explored_nodes)} nodes")
+                    if self.use_gpu:
+                        print("[A*] Pathfinding completed using GPU acceleration")
+                    elif NUMBA_AVAILABLE:
+                        print("[A*] Pathfinding completed using CPU with Numba JIT")
+                    else:
+                        print("[A*] Pathfinding completed using optimized CPU")
+                    goal_node.parent_index = current.parent_index
+                    goal_node.cost = current.cost
+                    break
+                
                 # Add to closed set
-            closed_set[c_id] = current
-
+                closed_set[c_id] = current
+            
             # Check if goal was found
             if goal_node.parent_index != -1:
                 break
@@ -948,232 +948,209 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
     
     def _process_single_node(self, current, c_id, goal_node, open_heap, open_set_dict, closed_set):
         """Process neighbors for a single node (CPU or fallback)"""
-            # Expand grid search based on motion model
-            neighbor_nodes = []
-            neighbor_coords = []
+        # Expand grid search based on motion model
+        neighbor_nodes = []
+        neighbor_coords = []
+        
+        for i, motion_step in enumerate(self.motion):
+            new_x = current.x + motion_step[0]
+            new_y = current.y + motion_step[1]
+            new_cost = current.cost + motion_step[2]
             
-            for i, motion_step in enumerate(self.motion):
-                new_x = current.x + motion_step[0]
-                new_y = current.y + motion_step[1]
-                new_cost = current.cost + motion_step[2]
-                
-                # Bounds check
-                if new_x < 0 or new_x >= self.x_width or new_y < 0 or new_y >= self.y_width:
-                    continue
-                
-                neighbor_nodes.append((new_x, new_y, new_cost, motion_step))
-                neighbor_coords.append((new_x, new_y))
+            # Bounds check
+            if new_x < 0 or new_x >= self.x_width or new_y < 0 or new_y >= self.y_width:
+                continue
             
-            # Batch verify all neighbors on GPU using CUDA
-            valid_neighbors = []
-            if self.use_gpu and GPU_AVAILABLE and GPU_USABLE and len(neighbor_coords) > 0:
-                try:
-                    # Prepare all data on GPU (CUDA) - minimize CPU-GPU transfers
-                    n_neighbors = len(neighbor_coords)
-                    x_coords = cp.array([nc[0] for nc in neighbor_coords], dtype=cp.int32)
-                    y_coords = cp.array([nc[1] for nc in neighbor_coords], dtype=cp.int32)
+            neighbor_nodes.append((new_x, new_y, new_cost, motion_step))
+            neighbor_coords.append((new_x, new_y))
+        
+        # Batch verify all neighbors on GPU using CUDA
+        valid_neighbors = []
+        if self.use_gpu and GPU_AVAILABLE and GPU_USABLE and len(neighbor_coords) > 0:
+            try:
+                # Prepare all data on GPU (CUDA) - minimize CPU-GPU transfers
+                n_neighbors = len(neighbor_coords)
+                x_coords = cp.array([nc[0] for nc in neighbor_coords], dtype=cp.int32)
+                y_coords = cp.array([nc[1] for nc in neighbor_coords], dtype=cp.int32)
+                
+                # Vectorized obstacle check on CUDA (all operations stay on GPU)
+                obstacles_gpu = self.obstacle_map_gpu[x_coords, y_coords]
+                
+                # Prepare distance field coordinates on GPU if needed
+                dist_values_gpu = None
+                if self.use_distance_cost and self.distance_field_norm_gpu is not None:
+                    df_width, df_height = self.distance_field_norm.shape
+                    # Compute distance field coordinates on GPU (all operations on CUDA)
+                    # Convert grid indices to world coordinates on GPU
+                    px_gpu = x_coords.astype(cp.float32) * self.resolution + self.min_x
+                    py_gpu = y_coords.astype(cp.float32) * self.resolution + self.min_y
                     
-                    # Vectorized obstacle check on CUDA (all operations stay on GPU)
-                    obstacles_gpu = self.obstacle_map_gpu[x_coords, y_coords]
+                    # Clip and convert to maze grid indices on GPU
+                    df_x_gpu = cp.clip(px_gpu, 0, df_width - 1).astype(cp.int32)
+                    df_y_gpu = cp.clip(py_gpu, 0, df_height - 1).astype(cp.int32)
                     
-                    # Prepare distance field coordinates on GPU if needed
-                    dist_values_gpu = None
-                    if self.use_distance_cost and self.distance_field_norm_gpu is not None:
-                        df_width, df_height = self.distance_field_norm.shape
-                        # Compute distance field coordinates on GPU (all operations on CUDA)
-                        # Convert grid indices to world coordinates on GPU
-                        px_gpu = x_coords.astype(cp.float32) * self.resolution + self.min_x
-                        py_gpu = y_coords.astype(cp.float32) * self.resolution + self.min_y
-                        
-                        # Clip and convert to maze grid indices on GPU
-                        df_x_gpu = cp.clip(px_gpu, 0, df_width - 1).astype(cp.int32)
-                        df_y_gpu = cp.clip(py_gpu, 0, df_height - 1).astype(cp.int32)
-                        
-                        # Batch distance field lookup on CUDA
-                        dist_values_gpu = self.distance_field_norm_gpu[df_x_gpu, df_y_gpu]
+                    # Batch distance field lookup on CUDA
+                    dist_values_gpu = self.distance_field_norm_gpu[df_x_gpu, df_y_gpu]
+                
+                # Prepare diagonal check data on GPU (all CUDA operations)
+                # Compute deltas for all neighbors on GPU
+                current_x_gpu = cp.array([current.x] * n_neighbors, dtype=cp.int32)
+                current_y_gpu = cp.array([current.y] * n_neighbors, dtype=cp.int32)
+                dx_gpu = x_coords - current_x_gpu
+                dy_gpu = y_coords - current_y_gpu
+                
+                # Identify diagonal moves on GPU (dx != 0 AND dy != 0)
+                is_diagonal = (dx_gpu != 0) & (dy_gpu != 0)
+                
+                # For diagonal moves, compute adjacent cell coordinates on GPU
+                adj1_x_gpu = current_x_gpu + dx_gpu
+                adj1_y_gpu = current_y_gpu
+                adj2_x_gpu = current_x_gpu
+                adj2_y_gpu = current_y_gpu + dy_gpu
+                
+                # Check bounds on GPU
+                adj1_valid = (adj1_x_gpu >= 0) & (adj1_x_gpu < self.x_width) & \
+                             (adj1_y_gpu >= 0) & (adj1_y_gpu < self.y_width)
+                adj2_valid = (adj2_x_gpu >= 0) & (adj2_x_gpu < self.x_width) & \
+                             (adj2_y_gpu >= 0) & (adj2_y_gpu < self.y_width)
+                
+                # Initialize obstacle arrays on GPU
+                adj1_obstacles = cp.zeros(n_neighbors, dtype=cp.bool_)
+                adj2_obstacles = cp.zeros(n_neighbors, dtype=cp.bool_)
+                
+                # Batch check adjacent cells on GPU using vectorized operations
+                # Use conditional indexing: only check where valid
+                valid_adj1_indices = cp.where(adj1_valid)[0]
+                valid_adj2_indices = cp.where(adj2_valid)[0]
+                
+                if len(valid_adj1_indices) > 0:
+                    adj1_x_valid = adj1_x_gpu[valid_adj1_indices]
+                    adj1_y_valid = adj1_y_gpu[valid_adj1_indices]
+                    adj1_obstacles[valid_adj1_indices] = self.obstacle_map_gpu[adj1_x_valid, adj1_y_valid]
+                
+                if len(valid_adj2_indices) > 0:
+                    adj2_x_valid = adj2_x_gpu[valid_adj2_indices]
+                    adj2_y_valid = adj2_y_gpu[valid_adj2_indices]
+                    adj2_obstacles[valid_adj2_indices] = self.obstacle_map_gpu[adj2_x_valid, adj2_y_valid]
+                
+                # Combine all checks on GPU using vectorized CUDA operations
+                # Valid if: not obstacle AND (distance OK) AND (not diagonal OR diagonal corners OK)
+                valid_mask = ~obstacles_gpu  # Not an obstacle
+                
+                # Apply distance field check if enabled (all on GPU)
+                if dist_values_gpu is not None:
+                    valid_mask = valid_mask & (dist_values_gpu >= self.min_clearance_norm)
+                
+                # Apply diagonal corner check (all on GPU)
+                # For diagonal moves, both adjacent cells must be free
+                diagonal_corner_blocked = is_diagonal & (adj1_obstacles | adj2_obstacles)
+                valid_mask = valid_mask & ~diagonal_corner_blocked
+                
+                # Single GPU-to-CPU transfer at the end (minimize transfers)
+                valid_mask_cpu = cp.asnumpy(valid_mask)
+                
+                # Extract valid neighbors
+                for idx, (new_x, new_y, new_cost, motion_step) in enumerate(neighbor_nodes):
+                    if valid_mask_cpu[idx]:
+                        valid_neighbors.append((new_x, new_y, new_cost))
                     
-                    # Prepare diagonal check data on GPU (all CUDA operations)
-                    # Compute deltas for all neighbors on GPU
-                    current_x_gpu = cp.array([current.x] * n_neighbors, dtype=cp.int32)
-                    current_y_gpu = cp.array([current.y] * n_neighbors, dtype=cp.int32)
-                    dx_gpu = x_coords - current_x_gpu
-                    dy_gpu = y_coords - current_y_gpu
-                    
-                    # Identify diagonal moves on GPU (dx != 0 AND dy != 0)
-                    is_diagonal = (dx_gpu != 0) & (dy_gpu != 0)
-                    
-                    # For diagonal moves, compute adjacent cell coordinates on GPU
-                    adj1_x_gpu = current_x_gpu + dx_gpu
-                    adj1_y_gpu = current_y_gpu
-                    adj2_x_gpu = current_x_gpu
-                    adj2_y_gpu = current_y_gpu + dy_gpu
-                    
-                    # Check bounds on GPU
-                    adj1_valid = (adj1_x_gpu >= 0) & (adj1_x_gpu < self.x_width) & \
-                                 (adj1_y_gpu >= 0) & (adj1_y_gpu < self.y_width)
-                    adj2_valid = (adj2_x_gpu >= 0) & (adj2_x_gpu < self.x_width) & \
-                                 (adj2_y_gpu >= 0) & (adj2_y_gpu < self.y_width)
-                    
-                    # Initialize obstacle arrays on GPU
-                    adj1_obstacles = cp.zeros(n_neighbors, dtype=cp.bool_)
-                    adj2_obstacles = cp.zeros(n_neighbors, dtype=cp.bool_)
-                    
-                    # Batch check adjacent cells on GPU using vectorized operations
-                    # Use conditional indexing: only check where valid
-                    valid_adj1_indices = cp.where(adj1_valid)[0]
-                    valid_adj2_indices = cp.where(adj2_valid)[0]
-                    
-                    if len(valid_adj1_indices) > 0:
-                        adj1_x_valid = adj1_x_gpu[valid_adj1_indices]
-                        adj1_y_valid = adj1_y_gpu[valid_adj1_indices]
-                        adj1_obstacles[valid_adj1_indices] = self.obstacle_map_gpu[adj1_x_valid, adj1_y_valid]
-                    
-                    if len(valid_adj2_indices) > 0:
-                        adj2_x_valid = adj2_x_gpu[valid_adj2_indices]
-                        adj2_y_valid = adj2_y_gpu[valid_adj2_indices]
-                        adj2_obstacles[valid_adj2_indices] = self.obstacle_map_gpu[adj2_x_valid, adj2_y_valid]
-                    
-                    # Combine all checks on GPU using vectorized CUDA operations
-                    # Valid if: not obstacle AND (distance OK) AND (not diagonal OR diagonal corners OK)
-                    valid_mask = ~obstacles_gpu  # Not an obstacle
-                    
-                    # Apply distance field check if enabled (all on GPU)
-                    if dist_values_gpu is not None:
-                        valid_mask = valid_mask & (dist_values_gpu >= self.min_clearance_norm)
-                    
-                    # Apply diagonal corner check (all on GPU)
-                    # For diagonal moves, both adjacent cells must be free
-                    diagonal_corner_blocked = is_diagonal & (adj1_obstacles | adj2_obstacles)
-                    valid_mask = valid_mask & ~diagonal_corner_blocked
-                    
-                    # Single GPU-to-CPU transfer at the end (minimize transfers)
-                    valid_mask_cpu = cp.asnumpy(valid_mask)
-                    
-                    # Extract valid neighbors
-                    for idx, (new_x, new_y, new_cost, motion_step) in enumerate(neighbor_nodes):
-                        if valid_mask_cpu[idx]:
-                            valid_neighbors.append((new_x, new_y, new_cost))
-                        
-                except Exception as e:
-                    # Fallback to individual checks if batch fails
-                    for new_x, new_y, new_cost, motion_step in neighbor_nodes:
-                        node = self.Node(new_x, new_y, new_cost, c_id)
-                        if self.verify_node(node, current):
-                            # Distance field check
-                            if self.use_distance_cost and self.distance_field_norm is not None:
-                                px = self.calc_grid_position(new_x, self.min_x)
-                                py = self.calc_grid_position(new_y, self.min_y)
-                                df_width, df_height = self.distance_field_norm.shape
-                                maze_x = int(np.clip(px, 0, df_width - 1))
-                                maze_y = int(np.clip(py, 0, df_height - 1))
-                                if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
-                                    dist_value = self.distance_field_norm[maze_x, maze_y]
-                                    if dist_value < self.min_clearance_norm:
-                                        continue
-                            valid_neighbors.append((new_x, new_y, new_cost))
-            else:
-                # CPU path: verify neighbors individually
+            except Exception as e:
+                # Fallback to individual checks if batch fails
                 for new_x, new_y, new_cost, motion_step in neighbor_nodes:
                     node = self.Node(new_x, new_y, new_cost, c_id)
-                    
-                    # Add clearance check based on distance field (if enabled)
-                    if self.use_distance_cost and self.distance_field_norm is not None:
-                        px = self.calc_grid_position(new_x, self.min_x)
-                        py = self.calc_grid_position(new_y, self.min_y)
-                        df_width, df_height = self.distance_field_norm.shape
-                        maze_x = int(np.clip(px, 0, df_width - 1))
-                        maze_y = int(np.clip(py, 0, df_height - 1))
-                        if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
-                            dist_value = self.distance_field_norm[maze_x, maze_y]
-                            if dist_value < self.min_clearance_norm:
-                                continue
-                    
                     if self.verify_node(node, current):
+                        # Distance field check
+                        if self.use_distance_cost and self.distance_field_norm is not None:
+                            px = self.calc_grid_position(new_x, self.min_x)
+                            py = self.calc_grid_position(new_y, self.min_y)
+                            df_width, df_height = self.distance_field_norm.shape
+                            maze_x = int(np.clip(px, 0, df_width - 1))
+                            maze_y = int(np.clip(py, 0, df_height - 1))
+                            if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
+                                dist_value = self.distance_field_norm[maze_x, maze_y]
+                                if dist_value < self.min_clearance_norm:
+                                    continue
                         valid_neighbors.append((new_x, new_y, new_cost))
-            
-            # Process valid neighbors - compute everything on GPU if available
-            if self.use_gpu and GPU_AVAILABLE and GPU_USABLE and len(valid_neighbors) > 0:
-                try:
-                    # Batch compute all values on GPU
-                    n_valid = len(valid_neighbors)
-                    valid_x_gpu = cp.array([vn[0] for vn in valid_neighbors], dtype=cp.int32)
-                    valid_y_gpu = cp.array([vn[1] for vn in valid_neighbors], dtype=cp.int32)
-                    valid_cost_gpu = cp.array([vn[2] for vn in valid_neighbors], dtype=cp.float32)
-                    
-                    # Compute grid indices on GPU
-                    # grid_index = y * x_width + x
-                    grid_indices_gpu = valid_y_gpu * self.x_width + valid_x_gpu
-                    
-                    # Compute grid positions (world coordinates) on GPU
-                    grid_pos_x_gpu = valid_x_gpu.astype(cp.float32) * self.resolution + self.min_x
-                    grid_pos_y_gpu = valid_y_gpu.astype(cp.float32) * self.resolution + self.min_y
-                    
-                    # Compute goal position on GPU
-                    goal_x_gpu = cp.array([goal_node.x] * n_valid, dtype=cp.int32)
-                    goal_y_gpu = cp.array([goal_node.y] * n_valid, dtype=cp.int32)
-                    goal_pos_x_gpu = goal_x_gpu.astype(cp.float32) * self.resolution + self.min_x
-                    goal_pos_y_gpu = goal_y_gpu.astype(cp.float32) * self.resolution + self.min_y
-                    
-                    # Compute heuristics on GPU (Euclidean distance)
-                    dx_gpu = grid_pos_x_gpu - goal_pos_x_gpu
-                    dy_gpu = grid_pos_y_gpu - goal_pos_y_gpu
-                    h_cost_gpu = cp.sqrt(dx_gpu * dx_gpu + dy_gpu * dy_gpu)
-                    
-                    # Compute f_cost on GPU
-                    f_cost_gpu = valid_cost_gpu + h_cost_gpu
-                    
-                    # Transfer results to CPU in one batch
-                    grid_indices_cpu = cp.asnumpy(grid_indices_gpu).astype(int)
-                    f_cost_cpu = cp.asnumpy(f_cost_gpu)
-                    h_cost_cpu = cp.asnumpy(h_cost_gpu)
-                    valid_cost_cpu = cp.asnumpy(valid_cost_gpu)
-                    
-                    # Process each neighbor with GPU-computed values
-                    for idx, (new_x, new_y, new_cost) in enumerate(valid_neighbors):
-                        n_id = int(grid_indices_cpu[idx])
-                        
-                        if n_id in closed_set:
+        else:
+            # CPU path: verify neighbors individually
+            for new_x, new_y, new_cost, motion_step in neighbor_nodes:
+                node = self.Node(new_x, new_y, new_cost, c_id)
+                
+                # Add clearance check based on distance field (if enabled)
+                if self.use_distance_cost and self.distance_field_norm is not None:
+                    px = self.calc_grid_position(new_x, self.min_x)
+                    py = self.calc_grid_position(new_y, self.min_y)
+                    df_width, df_height = self.distance_field_norm.shape
+                    maze_x = int(np.clip(px, 0, df_width - 1))
+                    maze_y = int(np.clip(py, 0, df_height - 1))
+                    if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
+                        dist_value = self.distance_field_norm[maze_x, maze_y]
+                        if dist_value < self.min_clearance_norm:
                             continue
-                        
-                        node = self.Node(new_x, new_y, valid_cost_cpu[idx], c_id)
-                        f_cost = float(f_cost_cpu[idx])
-                        
-                        if n_id not in open_set_dict:
-                            # New node discovered
+                
+                if self.verify_node(node, current):
+                    valid_neighbors.append((new_x, new_y, new_cost))
+        
+        # Process valid neighbors - compute everything on GPU if available
+        if self.use_gpu and GPU_AVAILABLE and GPU_USABLE and len(valid_neighbors) > 0:
+            try:
+                # Batch compute all values on GPU
+                n_valid = len(valid_neighbors)
+                valid_x_gpu = cp.array([vn[0] for vn in valid_neighbors], dtype=cp.int32)
+                valid_y_gpu = cp.array([vn[1] for vn in valid_neighbors], dtype=cp.int32)
+                valid_cost_gpu = cp.array([vn[2] for vn in valid_neighbors], dtype=cp.float32)
+                
+                # Compute grid indices on GPU
+                # grid_index = y * x_width + x
+                grid_indices_gpu = valid_y_gpu * self.x_width + valid_x_gpu
+                
+                # Compute grid positions (world coordinates) on GPU
+                grid_pos_x_gpu = valid_x_gpu.astype(cp.float32) * self.resolution + self.min_x
+                grid_pos_y_gpu = valid_y_gpu.astype(cp.float32) * self.resolution + self.min_y
+                
+                # Compute goal position on GPU
+                goal_x_gpu = cp.array([goal_node.x] * n_valid, dtype=cp.int32)
+                goal_y_gpu = cp.array([goal_node.y] * n_valid, dtype=cp.int32)
+                goal_pos_x_gpu = goal_x_gpu.astype(cp.float32) * self.resolution + self.min_x
+                goal_pos_y_gpu = goal_y_gpu.astype(cp.float32) * self.resolution + self.min_y
+                
+                # Compute heuristics on GPU (Euclidean distance)
+                dx_gpu = grid_pos_x_gpu - goal_pos_x_gpu
+                dy_gpu = grid_pos_y_gpu - goal_pos_y_gpu
+                h_cost_gpu = cp.sqrt(dx_gpu * dx_gpu + dy_gpu * dy_gpu)
+                
+                # Compute f_cost on GPU
+                f_cost_gpu = valid_cost_gpu + h_cost_gpu
+                
+                # Transfer results to CPU in one batch
+                grid_indices_cpu = cp.asnumpy(grid_indices_gpu).astype(int)
+                f_cost_cpu = cp.asnumpy(f_cost_gpu)
+                h_cost_cpu = cp.asnumpy(h_cost_gpu)
+                valid_cost_cpu = cp.asnumpy(valid_cost_gpu)
+                
+                # Process each neighbor with GPU-computed values
+                for idx, (new_x, new_y, new_cost) in enumerate(valid_neighbors):
+                    n_id = int(grid_indices_cpu[idx])
+                    
+                    if n_id in closed_set:
+                        continue
+                    
+                    node = self.Node(new_x, new_y, valid_cost_cpu[idx], c_id)
+                    f_cost = float(f_cost_cpu[idx])
+                    
+                    if n_id not in open_set_dict:
+                        # New node discovered
+                        open_set_dict[n_id] = node
+                        heapq.heappush(open_heap, (f_cost, valid_cost_cpu[idx], n_id, node))
+                    else:
+                        # Update if we found a better path
+                        existing_node = open_set_dict[n_id]
+                        if existing_node.cost > valid_cost_cpu[idx]:
                             open_set_dict[n_id] = node
                             heapq.heappush(open_heap, (f_cost, valid_cost_cpu[idx], n_id, node))
-                        else:
-                            # Update if we found a better path
-                            existing_node = open_set_dict[n_id]
-                            if existing_node.cost > valid_cost_cpu[idx]:
-                                open_set_dict[n_id] = node
-                                heapq.heappush(open_heap, (f_cost, valid_cost_cpu[idx], n_id, node))
-                                
-                except Exception as e:
-                    # Fallback to CPU computation
-                    for new_x, new_y, new_cost in valid_neighbors:
-                        node = self.Node(new_x, new_y, new_cost, c_id)
-                        n_id = self.calc_grid_index(node)
-
-                        if n_id in closed_set:
-                            continue
-
-                        # Calculate heuristic and f_cost
-                        h_cost = self.calc_heuristic(goal_node, node)
-                        f_cost = new_cost + h_cost
-
-                        if n_id not in open_set_dict:
-                            # New node discovered
-                            open_set_dict[n_id] = node
-                            heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
-                        else:
-                            # Update if we found a better path
-                            existing_node = open_set_dict[n_id]
-                            if existing_node.cost > new_cost:
-                                open_set_dict[n_id] = node
-                                heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
-            else:
-                # CPU path: compute individually
+                            
+            except Exception as e:
+                # Fallback to CPU computation
                 for new_x, new_y, new_cost in valid_neighbors:
                     node = self.Node(new_x, new_y, new_cost, c_id)
                     n_id = self.calc_grid_index(node)
@@ -1195,7 +1172,30 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                         if existing_node.cost > new_cost:
                             open_set_dict[n_id] = node
                             heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
+        else:
+            # CPU path: compute individually
+            for new_x, new_y, new_cost in valid_neighbors:
+                node = self.Node(new_x, new_y, new_cost, c_id)
+                n_id = self.calc_grid_index(node)
 
+                if n_id in closed_set:
+                    continue
+
+                # Calculate heuristic and f_cost
+                h_cost = self.calc_heuristic(goal_node, node)
+                f_cost = new_cost + h_cost
+
+                if n_id not in open_set_dict:
+                    # New node discovered
+                    open_set_dict[n_id] = node
+                    heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
+                else:
+                    # Update if we found a better path
+                    existing_node = open_set_dict[n_id]
+                    if existing_node.cost > new_cost:
+                        open_set_dict[n_id] = node
+                        heapq.heappush(open_heap, (f_cost, new_cost, n_id, node))
+    
     def _process_batch_nodes_gpu(self, batch_nodes, goal_node, open_heap, open_set_dict, closed_set):
         """Process neighbors for multiple nodes in parallel on GPU"""
         # Collect all neighbors from all nodes in the batch
