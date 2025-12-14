@@ -92,6 +92,7 @@ def load_planner_config():
         "detection_mode": "canny",
         "canny_threshold1": 100,
         "canny_threshold2": 200,
+        "sobel_threshold": 50,  # Threshold for Sobel edge detection (0-255)
         "map_file": None,
         "grid_resolution": 1.0,  # Node grid cell size in pixels. 1.0 = 1 pixel per node, 10.0 = 10x10 pixels per node
         "obstacle_map_resolution": 1.0,  # Obstacle map resolution for collision detection. 1.0 = full pixel resolution (max sensitivity)
@@ -303,17 +304,18 @@ class Maze:
             return compute_udf_scipy(obstacles_bool)
     
     @staticmethod
-    def from_image(image_path, start_pos=None, exit_pos=None, detection_mode='canny', canny_threshold1=100, canny_threshold2=200):
+    def from_image(image_path, start_pos=None, exit_pos=None, detection_mode='canny', canny_threshold1=100, canny_threshold2=200, sobel_threshold=50):
         """
-        Create a maze from a PNG image using either Canny edge detection or legacy threshold mode
+        Create a maze from a PNG image using edge detection (Canny or Sobel) or legacy threshold mode
         
         Args:
             image_path: Path to PNG image
             start_pos: Tuple (x, y) for start position, or None for auto-detection
             exit_pos: Tuple (x, y) for exit position, or None for auto-detection
-            detection_mode: 'canny' for Canny edge detection, 'none' for legacy threshold mode
+            detection_mode: 'canny' for Canny edge detection, 'sobel' for Sobel edge detection, 'none' for legacy threshold mode
             canny_threshold1: Lower threshold for Canny edge detection (default: 100)
             canny_threshold2: Upper threshold for Canny edge detection (default: 200)
+            sobel_threshold: Threshold for Sobel edge detection (default: 50)
         
         Returns:
             Maze object
@@ -351,6 +353,39 @@ class Maze:
                 print(f"Canny edge map saved to: {canny_output_path}")
             except Exception as e:
                 print(f"[Warning] Failed to save Canny edge map: {e}")
+        
+        elif detection_mode == 'sobel':
+            # Apply Gaussian blur to reduce noise before edge detection
+            blurred = cv2.GaussianBlur(img, (5, 5), 1.4)
+            
+            # Apply Sobel edge detection
+            # Sobel computes gradient in x and y directions
+            sobel_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+            sobel_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+            
+            # Compute gradient magnitude
+            sobel_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+            
+            # Normalize to 0-255 range
+            sobel_magnitude = np.uint8(255 * sobel_magnitude / (np.max(sobel_magnitude) + 1e-8))
+            
+            # Apply threshold to create binary edge map
+            # Pixels above threshold = edges = obstacles
+            _, edges = cv2.threshold(sobel_magnitude, sobel_threshold, 255, cv2.THRESH_BINARY)
+            
+            # Store Sobel edge map directly as numpy array
+            # Sobel output: white (255) = edges = obstacles, black (0) = free space
+            maze.canny_edge_map = edges  # Reuse canny_edge_map variable for backward compatibility
+
+            # Save Sobel edge map for reference
+            try:
+                maps_dir = os.path.dirname(image_path)
+                sobel_output_path = os.path.join(maps_dir, 'sobel.png')
+                cv2.imwrite(sobel_output_path, edges)
+                print(f"Sobel edge map saved to: {sobel_output_path}")
+            except Exception as e:
+                print(f"[Warning] Failed to save Sobel edge map: {e}")
+        
         else:
             # Legacy mode: black pixels = walls, white pixels = free paths
             # Convert to binary: threshold at 128 (black < 128 = wall, white >= 128 = free)
@@ -1742,6 +1777,7 @@ def load_maze_from_maps():
     detection_mode = config.get("detection_mode", "canny")
     canny_threshold1 = config.get("canny_threshold1", 100)
     canny_threshold2 = config.get("canny_threshold2", 200)
+    sobel_threshold = config.get("sobel_threshold", 50)
     map_file = config.get("map_file")
     
     # Choose image: prefer map_file from config if it exists; otherwise prefer sophisticated_maze.png
@@ -1768,7 +1804,8 @@ def load_maze_from_maps():
         maze = Maze.from_image(image_path, 
                               detection_mode=detection_mode,
                               canny_threshold1=canny_threshold1,
-                              canny_threshold2=canny_threshold2)
+                              canny_threshold2=canny_threshold2,
+                              sobel_threshold=sobel_threshold)
         print(f"Successfully loaded maze: {maze.width}x{maze.height}")
         print(f"Start position: {maze.start}")
         print(f"Exit position: {maze.exit}")
