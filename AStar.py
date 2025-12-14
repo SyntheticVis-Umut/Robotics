@@ -478,26 +478,57 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         # Use GPU if available for distance calculations
         if GPU_AVAILABLE and GPU_USABLE:
             try:
-                print("[GPU] Computing obstacle map on GPU...")
-                # Transfer to GPU
+                num_obstacles = len(ox_array)
+                batch_size = 2000  # Process obstacles in batches to avoid GPU memory issues
+                
+                print(f"[GPU] Computing obstacle map on GPU (processing {num_obstacles} obstacles in batches)...")
+                
+                # Transfer grid coordinates to GPU (only once)
                 X_gpu = cp.asarray(X)
                 Y_gpu = cp.asarray(Y)
-                ox_gpu = cp.asarray(ox_array)
-                oy_gpu = cp.asarray(oy_array)
                 rr_gpu = cp.float32(self.rr)
                 
-                # Compute distances using broadcasting on GPU
-                # Shape: (x_width, y_width, num_obstacles)
-                dx = X_gpu[:, :, cp.newaxis] - ox_gpu[cp.newaxis, cp.newaxis, :]
-                dy = Y_gpu[:, :, cp.newaxis] - oy_gpu[cp.newaxis, cp.newaxis, :]
-                distances = cp.sqrt(dx * dx + dy * dy)
+                # Initialize obstacle map on GPU (all False initially)
+                obstacle_map_gpu = cp.zeros((self.x_width, self.y_width), dtype=cp.bool_)
                 
-                # Check if any obstacle is within robot radius
-                # Shape: (x_width, y_width)
-                obstacle_map_gpu = cp.any(distances <= rr_gpu, axis=2)
+                # Process obstacles in batches
+                num_batches = (num_obstacles + batch_size - 1) // batch_size
+                print(f"[GPU] Processing {num_obstacles} obstacles in {num_batches} batches of ~{batch_size}")
                 
-                # Transfer back to CPU
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, num_obstacles)
+                    batch_ox = ox_array[start_idx:end_idx]
+                    batch_oy = oy_array[start_idx:end_idx]
+                    
+                    # Transfer batch to GPU
+                    ox_batch_gpu = cp.asarray(batch_ox)
+                    oy_batch_gpu = cp.asarray(batch_oy)
+                    
+                    # Compute distances using broadcasting on GPU for this batch
+                    # Shape: (x_width, y_width, batch_size)
+                    dx = X_gpu[:, :, cp.newaxis] - ox_batch_gpu[cp.newaxis, cp.newaxis, :]
+                    dy = Y_gpu[:, :, cp.newaxis] - oy_batch_gpu[cp.newaxis, cp.newaxis, :]
+                    distances = cp.sqrt(dx * dx + dy * dy)
+                    
+                    # Check if any obstacle in this batch is within robot radius
+                    # Shape: (x_width, y_width)
+                    batch_obstacle_map = cp.any(distances <= rr_gpu, axis=2)
+                    
+                    # Accumulate results using logical OR
+                    obstacle_map_gpu = obstacle_map_gpu | batch_obstacle_map
+                    
+                    # Free GPU memory for this batch
+                    del dx, dy, distances, batch_obstacle_map, ox_batch_gpu, oy_batch_gpu
+                    cp.get_default_memory_pool().free_all_blocks()
+                
+                # Transfer final result back to CPU
                 obstacle_map = cp.asnumpy(obstacle_map_gpu)
+                
+                # Clean up GPU memory
+                del X_gpu, Y_gpu, obstacle_map_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
                 print("[GPU] ✓ Obstacle map computed on GPU")
             except Exception as e:
                 print(f"[GPU] ⚠ GPU computation failed: {e}, using CPU")
