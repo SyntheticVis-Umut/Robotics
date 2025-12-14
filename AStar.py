@@ -477,17 +477,23 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
         else:
             self.distance_field_norm = None
         
-        # Use GPU for obstacle map if available and usable
+        # Use GPU for obstacle map and distance field if available and usable
         self.use_gpu = False
+        self.distance_field_norm_gpu = None
         if GPU_AVAILABLE and GPU_USABLE:
             try:
                 self.obstacle_map_gpu = cp.asarray(self.obstacle_map)
+                # Also create GPU version of distance field if available
+                if self.distance_field_norm is not None:
+                    self.distance_field_norm_gpu = cp.asarray(self.distance_field_norm)
                 self.use_gpu = True
                 print(f"[GPU] ✓ Using GPU for obstacle map processing")
                 print(f"[GPU] Obstacle map size: {self.x_width}x{self.y_width}")
+                if self.distance_field_norm_gpu is not None:
+                    print(f"[GPU] ✓ Using GPU for distance field lookups")
             except Exception as e:
                 self.use_gpu = False
-                print(f"[GPU] ✗ Failed to initialize GPU obstacle map: {e}")
+                print(f"[GPU] ✗ Failed to initialize GPU arrays: {e}")
                 print("[GPU] Falling back to CPU")
         else:
             self.use_gpu = False
@@ -539,12 +545,57 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
     def verify_node(self, node, parent_node=None):
         """
         Verify node with additional check for diagonal movement through wall corners.
-        Uses optimized JIT-compiled version if available.
+        Uses GPU acceleration if available, otherwise JIT-compiled version or fallback.
         """
         parent_x = parent_node.x if parent_node is not None else None
         parent_y = parent_node.y if parent_node is not None else None
         
-        if NUMBA_AVAILABLE:
+        # Use GPU if available
+        if self.use_gpu and GPU_AVAILABLE and GPU_USABLE:
+            # Bounds check
+            if node.x < 0 or node.x >= self.x_width or node.y < 0 or node.y >= self.y_width:
+                return False
+            
+            # Collision check using GPU array
+            try:
+                # Use item() to get Python scalar directly from GPU (more efficient than asnumpy)
+                if self.obstacle_map_gpu[node.x, node.y].item():
+                    return False
+            except Exception as e:
+                # Fallback to CPU if GPU access fails
+                if self.obstacle_map_np[node.x, node.y]:
+                    return False
+            
+            # Diagonal corner check
+            if parent_x is not None and parent_y is not None:
+                dx = node.x - parent_x
+                dy = node.y - parent_y
+                
+                # If diagonal move, check adjacent cells
+                if dx != 0 and dy != 0:
+                    adj1_x = parent_x + dx
+                    adj1_y = parent_y
+                    adj2_x = parent_x
+                    adj2_y = parent_y + dy
+                    
+                    if (0 <= adj1_x < self.x_width and 0 <= adj1_y < self.y_width and
+                        0 <= adj2_x < self.x_width and 0 <= adj2_y < self.y_width):
+                        try:
+                            # Use GPU for adjacent cell checks (batch check for efficiency)
+                            adj1_val = self.obstacle_map_gpu[adj1_x, adj1_y].item()
+                            adj2_val = self.obstacle_map_gpu[adj2_x, adj2_y].item()
+                            if adj1_val or adj2_val:
+                                return False
+                        except Exception:
+                            # Fallback to CPU
+                            if (self.obstacle_map_np[adj1_x, adj1_y] or 
+                                self.obstacle_map_np[adj2_x, adj2_y]):
+                                return False
+            
+            return True
+        
+        # Use CPU with Numba JIT if available
+        elif NUMBA_AVAILABLE:
             return self.verify_node_fast(node.x, node.y, self.x_width, self.y_width,
                                         self.obstacle_map_np, parent_x, parent_y)
         else:
@@ -671,7 +722,16 @@ class AStarPlannerWithTracking(a_star.AStarPlanner):
                     
                     # Get normalized distance (0 = at wall, 1 = far from wall)
                     if 0 <= maze_x < df_width and 0 <= maze_y < df_height:
-                        dist_value = self.distance_field_norm[maze_x, maze_y]
+                        # Use GPU if available, otherwise CPU
+                        if self.use_gpu and self.distance_field_norm_gpu is not None:
+                            try:
+                                dist_value = self.distance_field_norm_gpu[maze_x, maze_y].item()
+                            except Exception:
+                                # Fallback to CPU
+                                dist_value = self.distance_field_norm[maze_x, maze_y]
+                        else:
+                            dist_value = self.distance_field_norm[maze_x, maze_y]
+                        
                         # Hard clearance cutoff: skip nodes below threshold
                         if dist_value < self.min_clearance_norm:
                             continue
