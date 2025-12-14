@@ -8,7 +8,7 @@
   "canny_threshold1": 100,
   "canny_threshold2": 200,
   "map_file": "map.png",
-  "grid_resolution": 10.0,
+  "grid_resolution": 5.0,
   "obstacle_map_resolution": 1.0
 }
 
