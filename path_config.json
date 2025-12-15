@@ -4,7 +4,7 @@
   "show_distance_map": true,
   "smoothing_enabled": true,
   "distance_heat_gamma": 0.2,
-  "edge_detection": "sobel",
+  "edge_detection": "none",
   "image": "map.png"
 }
 
