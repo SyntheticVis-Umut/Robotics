@@ -19,12 +19,14 @@ import os
 import math
 import glob
 import heapq
+import json
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation
 from scipy.spatial import cKDTree
+import cv2
 
 # Add the pythonrobotics path to import Hybrid A* algorithm
 sys.path.insert(0, '/Users/umutozdemir/Desktop/pythonrobotics')
@@ -79,6 +81,27 @@ ROBOT_RADIUS = 0.3
 MAZE_SCALE = 5.0  # Scale maze coordinates by this factor
 XY_GRID_RESOLUTION = 2.0  # Grid resolution for Hybrid A*
 YAW_GRID_RESOLUTION = np.deg2rad(15.0)  # Yaw angle resolution (15 degrees)
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "path_config.json")
+
+
+def load_planner_config():
+    """Load planner configuration from JSON; fall back to defaults if missing/invalid."""
+    defaults = {
+        "edge_detection": "none",
+        "image": "map.png",
+    }
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = data[k]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[Config] Warning: failed to load path_config.json: {e}")
+    return defaults
 
 
 class Maze:
@@ -559,6 +582,51 @@ class MazeGame:
         plt.show()
 
 
+def apply_edge_detection(image_path, edge_type, output_path):
+    """
+    Apply edge detection to an image and save the result.
+    
+    Args:
+        image_path: Path to input image
+        edge_type: 'canny' or 'sobel'
+        output_path: Path to save the processed image
+    
+    Returns:
+        Path to the processed image
+    """
+    # Load image in grayscale
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    
+    if img is None:
+        raise ValueError(f"Could not load image: {image_path}")
+    
+    if edge_type == 'canny':
+        # Apply Gaussian Blur to reduce noise
+        blur = cv2.GaussianBlur(img, (5, 5), 1.4)
+        # Apply Canny Edge Detector
+        edges = cv2.Canny(blur, threshold1=100, threshold2=200)
+        # Invert colors before saving
+        edges = cv2.bitwise_not(edges)
+        cv2.imwrite(output_path, edges)
+        print(f"[Edge Detection] Applied Canny edge detection, saved to: {os.path.basename(output_path)}")
+    elif edge_type == 'sobel':
+        # Apply Sobel operator
+        sobelx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)  # Horizontal edges
+        sobely = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)  # Vertical edges
+        # Compute gradient magnitude
+        gradient_magnitude = cv2.magnitude(sobelx, sobely)
+        # Convert to uint8
+        gradient_magnitude = cv2.convertScaleAbs(gradient_magnitude)
+        # Invert colors before saving
+        gradient_magnitude = cv2.bitwise_not(gradient_magnitude)
+        cv2.imwrite(output_path, gradient_magnitude)
+        print(f"[Edge Detection] Applied Sobel edge detection, saved to: {os.path.basename(output_path)}")
+    else:
+        raise ValueError(f"Unknown edge detection type: {edge_type}")
+    
+    return output_path
+
+
 def load_maze_from_maps():
     """Check maps folder for PNG files and load the first one found"""
     maps_dir = os.path.join(os.path.dirname(__file__), 'maps')
@@ -566,6 +634,11 @@ def load_maze_from_maps():
     if not os.path.exists(maps_dir):
         print(f"Maps directory not found: {maps_dir}")
         return None
+    
+    # Load configuration
+    config = load_planner_config()
+    edge_detection = config.get("edge_detection", "none")
+    image_name = config.get("image", "map.png")
     
     # Find all PNG files in maps directory
     png_files = glob.glob(os.path.join(maps_dir, '*.png'))
@@ -575,14 +648,34 @@ def load_maze_from_maps():
         print(f"No PNG files found in {maps_dir}")
         return None
     
-    # Prefer sophisticated_maze.png if it exists
-    sophisticated_maze = os.path.join(maps_dir, 'sophisticated_maze.png')
-    if os.path.exists(sophisticated_maze):
-        image_path = sophisticated_maze
+    # Use the specified image from config, or fall back to first PNG file found
+    specified_image = os.path.join(maps_dir, image_name)
+    if os.path.exists(specified_image):
+        original_image_path = specified_image
     else:
-        image_path = png_files[0]
+        print(f"[Config] Specified image '{image_name}' not found, using first available PNG file")
+        original_image_path = png_files[0]
     
-    print(f"Loading maze from image: {os.path.basename(image_path)}")
+    # Apply edge detection if specified
+    if edge_detection == 'none':
+        image_path = original_image_path
+        print(f"Loading maze from image: {os.path.basename(image_path)}")
+    elif edge_detection in ['canny', 'sobel']:
+        # Create output path for edge-detected image
+        output_filename = f"{edge_detection}.png"
+        output_path = os.path.join(maps_dir, output_filename)
+        
+        # Apply edge detection
+        try:
+            image_path = apply_edge_detection(original_image_path, edge_detection, output_path)
+            print(f"Loading maze from edge-detected image: {os.path.basename(image_path)}")
+        except Exception as e:
+            print(f"[Edge Detection] Error applying {edge_detection}: {e}")
+            print(f"[Edge Detection] Falling back to original image")
+            image_path = original_image_path
+    else:
+        print(f"[Edge Detection] Unknown edge detection type: {edge_detection}, using original image")
+        image_path = original_image_path
     
     try:
         maze = Maze.from_image(image_path)

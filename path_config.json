@@ -3,7 +3,8 @@
   "num_points_per_segment": 15,
   "show_distance_map": true,
   "smoothing_enabled": true,
-  "distance_heat_gamma": 0.2
-
+  "distance_heat_gamma": 0.2,
+  "edge_detection": "sobel",
+  "image": "map.png"
 }
 
