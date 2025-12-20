@@ -133,7 +133,7 @@ def load_planner_config():
         "show_distance_map": True,
         "smoothing_enabled": True,
         "distance_heat_gamma": 1.0,
-        "detection_mode": "canny",
+        "detection_mode": "canny",  # Options: "canny", "sobel", "direct", "none"
         "canny_threshold1": 100,
         "canny_threshold2": 200,
         "sobel_threshold": 50,  # Threshold for Sobel edge detection (0-255)
@@ -356,7 +356,7 @@ class Maze:
             image_path: Path to PNG image
             start_pos: Tuple (x, y) for start position, or None for auto-detection
             exit_pos: Tuple (x, y) for exit position, or None for auto-detection
-            detection_mode: 'canny' for Canny edge detection, 'sobel' for Sobel edge detection, 'none' for legacy threshold mode
+            detection_mode: 'canny' for Canny edge detection, 'sobel' for Sobel edge detection, 'direct' for direct binary threshold (bypasses edge detection), 'none' for legacy threshold mode
             canny_threshold1: Lower threshold for Canny edge detection (default: 100)
             canny_threshold2: Upper threshold for Canny edge detection (default: 200)
             sobel_threshold: Threshold for Sobel edge detection (default: 50)
@@ -429,6 +429,18 @@ class Maze:
                 print(f"Sobel edge map saved to: {sobel_output_path}")
             except Exception as e:
                 print(f"[Warning] Failed to save Sobel edge map: {e}")
+        
+        elif detection_mode == 'direct':
+            # Direct mode: Use original image directly as obstacle map (bypasses edge detection)
+            # Black pixels (< threshold) = obstacles, White pixels (>= threshold) = free space
+            threshold = 127
+            _, binary = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY_INV)
+            # Store directly as obstacle map (same format as edge detection)
+            # binary: white (255) = obstacles, black (0) = free space
+            maze.canny_edge_map = binary  # Reuse canny_edge_map variable for compatibility
+            
+            print(f"[Direct Mode] Using original image as obstacle map (threshold: {threshold})")
+            print(f"[Direct Mode] Black pixels (< {threshold}) = obstacles, White pixels (>= {threshold}) = free space")
         
         else:
             # Legacy mode: black pixels = walls, white pixels = free paths
