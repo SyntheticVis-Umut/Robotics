@@ -562,6 +562,18 @@ class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
         print("x_width:", self.x_width)
         print("y_width:", self.y_width)
 
+        # If using distance field only, skip obstacle map computation
+        if self.use_distance_field_only:
+            print("[Dijkstra] ⚠ Bypassing obstacle map computation - using distance field only")
+            print("[Dijkstra] Collision detection will use distance field values directly")
+            # Create empty obstacle map for compatibility
+            self.obstacle_map = [[False for iy in range(self.y_width)]
+                                 for ix in range(self.x_width)]
+            # Store empty full-resolution map for visualization
+            self.obstacle_map_full = None
+            self.obstacle_map_full_resolution = self.obstacle_map_resolution
+            return
+
         # Obstacle map size (for collision detection precision)
         # Use obstacle_map_resolution for precise collision checking
         obstacle_x_width = round((self.max_x - self.min_x) / self.obstacle_map_resolution)
@@ -687,15 +699,8 @@ class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
         self.obstacle_map_full_resolution = self.obstacle_map_resolution
         
         # Convert to list of lists format expected by parent class (node grid size)
-        # If using distance field only, create empty obstacle map (will use distance field for collision)
-        if self.use_distance_field_only:
-            # Create empty obstacle map - collision checking will use distance field instead
-            self.obstacle_map = [[False for iy in range(self.y_width)]
-                                 for ix in range(self.x_width)]
-            print("[Dijkstra] ⚠ Bypassing obstacle map - using distance field only for collision detection")
-        else:
-            self.obstacle_map = [[bool(obstacle_map[ix][iy]) for iy in range(self.y_width)]
-                                 for ix in range(self.x_width)]
+        self.obstacle_map = [[bool(obstacle_map[ix][iy]) for iy in range(self.y_width)]
+                             for ix in range(self.x_width)]
     
     def _calc_obstacle_map_cpu_vectorized(self, X, Y, ox_array, oy_array, rr):
         """
