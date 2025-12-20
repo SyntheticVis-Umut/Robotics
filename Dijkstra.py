@@ -1374,31 +1374,35 @@ class MazeGame:
             planner = self.pathfinder.planner
             if hasattr(planner, 'obstacle_map_full') and planner.obstacle_map_full is not None:
                 obstacle_map = planner.obstacle_map_full
-                obstacle_res = planner.obstacle_map_full_resolution
                 
-                # Get obstacle map bounds
-                min_x = planner.min_x
-                min_y = planner.min_y
-                max_x = planner.max_x
-                max_y = planner.max_y
+                # Rescale obstacle map to maze resolution so it aligns with distance map
+                if obstacle_map.shape != (self.maze.width, self.maze.height):
+                    try:
+                        obstacle_vis = cv2.resize(
+                            (obstacle_map.astype(np.uint8) * 255),
+                            (self.maze.width, self.maze.height),
+                            interpolation=cv2.INTER_NEAREST
+                        )
+                        obstacle_vis = (obstacle_vis > 0).astype(float)
+                    except Exception:
+                        scale_x = max(1, int(round(self.maze.width / obstacle_map.shape[0])))
+                        scale_y = max(1, int(round(self.maze.height / obstacle_map.shape[1])))
+                        obstacle_vis = np.kron(obstacle_map.astype(float), np.ones((scale_x, scale_y)))
+                        obstacle_vis = obstacle_vis[:self.maze.width, :self.maze.height]
+                else:
+                    obstacle_vis = obstacle_map.astype(float)
                 
-                # Create extent for imshow (x_min, x_max, y_min, y_max)
-                extent = [
-                    min_x - 0.5 * obstacle_res,
-                    max_x + 0.5 * obstacle_res,
-                    min_y - 0.5 * obstacle_res,
-                    max_y + 0.5 * obstacle_res
-                ]
+                # Use same extent as distance map to ensure alignment
+                extent = [-0.5, self.maze.width - 0.5, -0.5, self.maze.height - 0.5]
                 
                 # Draw obstacle map as semi-transparent overlay
-                # obstacle_map is (x_width, y_width) format, need to transpose for imshow
                 obstacle_plot = self.ax.imshow(
-                    obstacle_map.T.astype(float),  # Transpose and convert to float for colormap
+                    obstacle_vis.T,  # Transpose to match imshow orientation
                     extent=extent,
                     origin='lower',
                     cmap='Reds',  # Red color for obstacles
                     alpha=0.4,  # Semi-transparent
-                    interpolation='nearest',  # No interpolation for discrete map
+                    interpolation='nearest',  # No smoothing; keep cells discrete
                     zorder=1  # Above distance field, below walls
                 )
         
