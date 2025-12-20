@@ -31,7 +31,51 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 # Add the pythonrobotics path to import Dijkstra algorithm
-sys.path.insert(0, '/Users/umutozdemir/Desktop/pythonrobotics')
+def find_pythonrobotics_path():
+    """Dynamically find the pythonrobotics directory path."""
+    # Get the directory where this script is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Strategy 1: Check if pythonrobotics is a sibling directory
+    parent_dir = os.path.dirname(current_dir)
+    sibling_path = os.path.join(parent_dir, 'pythonrobotics')
+    if os.path.exists(sibling_path) and os.path.isdir(sibling_path):
+        return sibling_path
+    
+    # Strategy 2: Check if pythonrobotics is in the current directory's parent
+    # (for cases where Robotics is inside pythonrobotics)
+    grandparent_dir = os.path.dirname(parent_dir)
+    grandparent_path = os.path.join(grandparent_dir, 'pythonrobotics')
+    if os.path.exists(grandparent_path) and os.path.isdir(grandparent_path):
+        return grandparent_path
+    
+    # Strategy 3: Search up the directory tree
+    search_dir = current_dir
+    for _ in range(5):  # Search up to 5 levels
+        search_dir = os.path.dirname(search_dir)
+        pythonrobotics_path = os.path.join(search_dir, 'pythonrobotics')
+        if os.path.exists(pythonrobotics_path) and os.path.isdir(pythonrobotics_path):
+            return pythonrobotics_path
+    
+    # Strategy 4: Check common locations
+    home_dir = os.path.expanduser('~')
+    common_paths = [
+        os.path.join(home_dir, 'Desktop', 'pythonrobotics'),
+        os.path.join(home_dir, 'Documents', 'pythonrobotics'),
+        os.path.join(home_dir, 'pythonrobotics'),
+    ]
+    for path in common_paths:
+        if os.path.exists(path) and os.path.isdir(path):
+            return path
+    
+    # If not found, raise an error
+    raise FileNotFoundError(
+        "Could not find pythonrobotics directory. Please ensure it's accessible. "
+        f"Searched from: {current_dir}"
+    )
+
+pythonrobotics_path = find_pythonrobotics_path()
+sys.path.insert(0, pythonrobotics_path)
 from PathPlanning.Dijkstra import dijkstra
 from PathPlanning.Catmull_RomSplinePath.catmull_rom_spline_path import catmull_rom_spline
 from Mapping.DistanceMap.distance_map import compute_udf_scipy, compute_sdf_scipy
@@ -85,7 +129,6 @@ def load_planner_config():
     """Load planner configuration from JSON; fall back to defaults if missing/invalid."""
     defaults = {
         "use_distance_cost": True,
-        "min_clearance_norm": 0.50,
         "num_points_per_segment": 15,
         "show_distance_map": True,
         "smoothing_enabled": True,
@@ -93,7 +136,10 @@ def load_planner_config():
         "detection_mode": "canny",
         "canny_threshold1": 100,
         "canny_threshold2": 200,
+        "sobel_threshold": 50,  # Threshold for Sobel edge detection (0-255)
         "map_file": None,
+        "grid_resolution": 1.0,  # Node grid cell size in pixels. 1.0 = 1 pixel per node, 10.0 = 10x10 pixels per node
+        "obstacle_map_resolution": 1.0,  # Obstacle map resolution for collision detection. 1.0 = full pixel resolution (max sensitivity)
     }
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -302,17 +348,18 @@ class Maze:
             return compute_udf_scipy(obstacles_bool)
     
     @staticmethod
-    def from_image(image_path, start_pos=None, exit_pos=None, detection_mode='canny', canny_threshold1=100, canny_threshold2=200):
+    def from_image(image_path, start_pos=None, exit_pos=None, detection_mode='canny', canny_threshold1=100, canny_threshold2=200, sobel_threshold=50):
         """
-        Create a maze from a PNG image using either Canny edge detection or legacy threshold mode
+        Create a maze from a PNG image using edge detection (Canny or Sobel) or legacy threshold mode
         
         Args:
             image_path: Path to PNG image
             start_pos: Tuple (x, y) for start position, or None for auto-detection
             exit_pos: Tuple (x, y) for exit position, or None for auto-detection
-            detection_mode: 'canny' for Canny edge detection, 'none' for legacy threshold mode
+            detection_mode: 'canny' for Canny edge detection, 'sobel' for Sobel edge detection, 'none' for legacy threshold mode
             canny_threshold1: Lower threshold for Canny edge detection (default: 100)
             canny_threshold2: Upper threshold for Canny edge detection (default: 200)
+            sobel_threshold: Threshold for Sobel edge detection (default: 50)
         
         Returns:
             Maze object
@@ -350,6 +397,39 @@ class Maze:
                 print(f"Canny edge map saved to: {canny_output_path}")
             except Exception as e:
                 print(f"[Warning] Failed to save Canny edge map: {e}")
+        
+        elif detection_mode == 'sobel':
+            # Apply Gaussian blur to reduce noise before edge detection
+            blurred = cv2.GaussianBlur(img, (5, 5), 1.4)
+            
+            # Apply Sobel edge detection
+            # Sobel computes gradient in x and y directions
+            sobel_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+            sobel_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+            
+            # Compute gradient magnitude
+            sobel_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+            
+            # Normalize to 0-255 range
+            sobel_magnitude = np.uint8(255 * sobel_magnitude / (np.max(sobel_magnitude) + 1e-8))
+            
+            # Apply threshold to create binary edge map
+            # Pixels above threshold = edges = obstacles
+            _, edges = cv2.threshold(sobel_magnitude, sobel_threshold, 255, cv2.THRESH_BINARY)
+            
+            # Store Sobel edge map directly as numpy array
+            # Sobel output: white (255) = edges = obstacles, black (0) = free space
+            maze.canny_edge_map = edges  # Reuse canny_edge_map variable for backward compatibility
+
+            # Save Sobel edge map for reference
+            try:
+                maps_dir = os.path.dirname(image_path)
+                sobel_output_path = os.path.join(maps_dir, 'sobel.png')
+                cv2.imwrite(sobel_output_path, edges)
+                print(f"Sobel edge map saved to: {sobel_output_path}")
+            except Exception as e:
+                print(f"[Warning] Failed to save Sobel edge map: {e}")
+        
         else:
             # Legacy mode: black pixels = walls, white pixels = free paths
             # Convert to binary: threshold at 128 (black < 128 = wall, white >= 128 = free)
@@ -444,7 +524,183 @@ def create_maze():
 class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
     """Optimized Dijkstra planner with GPU support, tracking, wall edge leak prevention, and distance field cost"""
     
-    def __init__(self, ox, oy, resolution, rr, distance_field=None, use_distance_cost=True, min_clearance_norm=0.50):
+    def calc_obstacle_map(self, ox, oy):
+        """
+        Optimized obstacle map calculation using vectorized operations.
+        Much faster than the original triple-nested loop, especially for large maps.
+        Uses GPU if available, otherwise vectorized CPU operations.
+        
+        Note: obstacle_map_resolution controls collision detection precision,
+        while self.resolution controls node grid size.
+        """
+        self.min_x = round(min(ox))
+        self.min_y = round(min(oy))
+        self.max_x = round(max(ox))
+        self.max_y = round(max(oy))
+        print("min_x:", self.min_x)
+        print("min_y:", self.min_y)
+        print("max_x:", self.max_x)
+        print("max_y:", self.max_y)
+
+        # Node grid size (for Dijkstra search space)
+        self.x_width = round((self.max_x - self.min_x) / self.resolution)
+        self.y_width = round((self.max_y - self.min_y) / self.resolution)
+        print("x_width:", self.x_width)
+        print("y_width:", self.y_width)
+
+        # Obstacle map size (for collision detection precision)
+        # Use obstacle_map_resolution for precise collision checking
+        obstacle_x_width = round((self.max_x - self.min_x) / self.obstacle_map_resolution)
+        obstacle_y_width = round((self.max_y - self.min_y) / self.obstacle_map_resolution)
+        print(f"[Obstacle Map] Resolution: {self.obstacle_map_resolution}, Size: {obstacle_x_width}x{obstacle_y_width}")
+
+        # Use vectorized operations for much faster obstacle map generation
+        # Create obstacle map grid coordinates (at obstacle_map_resolution)
+        obstacle_x_coords = np.arange(obstacle_x_width) * self.obstacle_map_resolution + self.min_x
+        obstacle_y_coords = np.arange(obstacle_y_width) * self.obstacle_map_resolution + self.min_y
+        
+        # Create meshgrid for obstacle map (full resolution)
+        X_obstacle, Y_obstacle = np.meshgrid(obstacle_x_coords, obstacle_y_coords, indexing='ij')
+        
+        # Also create node grid coordinates (at node grid resolution) for sampling
+        x_coords = np.arange(self.x_width) * self.resolution + self.min_x
+        y_coords = np.arange(self.y_width) * self.resolution + self.min_y
+        X, Y = np.meshgrid(x_coords, y_coords, indexing='ij')
+        
+        # Create meshgrid for all grid points
+        X, Y = np.meshgrid(x_coords, y_coords, indexing='ij')
+        
+        # Convert obstacle points to numpy array
+        ox_array = np.array(ox)
+        oy_array = np.array(oy)
+        
+        # Get robot radius (use stored value if available, otherwise use self.rr)
+        rr = getattr(self, '_rr_stored', getattr(self, 'rr', None))
+        if rr is None:
+            raise AttributeError("Robot radius (rr) not available. This should be set before calc_obstacle_map is called.")
+        
+        # Use GPU if available for distance calculations
+        if GPU_AVAILABLE and GPU_USABLE:
+            try:
+                num_obstacles = len(ox_array)
+                batch_size = 2000  # Process obstacles in batches to avoid GPU memory issues
+                
+                print(f"[GPU] Computing obstacle map on GPU at {self.obstacle_map_resolution}px resolution (processing {num_obstacles} obstacles in batches)...")
+                
+                # Transfer obstacle map grid coordinates to GPU (full resolution for collision detection)
+                X_obstacle_gpu = cp.asarray(X_obstacle)
+                Y_obstacle_gpu = cp.asarray(Y_obstacle)
+                rr_gpu = cp.float32(rr)
+                
+                # Initialize full-resolution obstacle map on GPU (all False initially)
+                obstacle_map_full_gpu = cp.zeros((obstacle_x_width, obstacle_y_width), dtype=cp.bool_)
+                
+                # Process obstacles in batches
+                num_batches = (num_obstacles + batch_size - 1) // batch_size
+                print(f"[GPU] Processing {num_obstacles} obstacles in {num_batches} batches of ~{batch_size}")
+                
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, num_obstacles)
+                    batch_ox = ox_array[start_idx:end_idx]
+                    batch_oy = oy_array[start_idx:end_idx]
+                    
+                    # Transfer batch to GPU
+                    ox_batch_gpu = cp.asarray(batch_ox)
+                    oy_batch_gpu = cp.asarray(batch_oy)
+                    
+                    # Compute distances using broadcasting on GPU for this batch
+                    # Shape: (obstacle_x_width, obstacle_y_width, batch_size)
+                    dx = X_obstacle_gpu[:, :, cp.newaxis] - ox_batch_gpu[cp.newaxis, cp.newaxis, :]
+                    dy = Y_obstacle_gpu[:, :, cp.newaxis] - oy_batch_gpu[cp.newaxis, cp.newaxis, :]
+                    distances = cp.sqrt(dx * dx + dy * dy)
+                    
+                    # Check if any obstacle in this batch is within robot radius
+                    # Shape: (obstacle_x_width, obstacle_y_width)
+                    batch_obstacle_map = cp.any(distances <= rr_gpu, axis=2)
+                    
+                    # Accumulate results using logical OR
+                    obstacle_map_full_gpu = obstacle_map_full_gpu | batch_obstacle_map
+                    
+                    # Free GPU memory for this batch
+                    del dx, dy, distances, batch_obstacle_map, ox_batch_gpu, oy_batch_gpu
+                    cp.get_default_memory_pool().free_all_blocks()
+                
+                # Transfer full-resolution obstacle map back to CPU
+                obstacle_map_full = cp.asnumpy(obstacle_map_full_gpu)
+                
+                # Sample full-resolution obstacle map at node grid positions
+                # Convert node grid positions to obstacle map indices
+                node_x_indices = ((X - self.min_x) / self.obstacle_map_resolution).astype(int)
+                node_y_indices = ((Y - self.min_y) / self.obstacle_map_resolution).astype(int)
+                
+                # Clip indices to valid range
+                node_x_indices = np.clip(node_x_indices, 0, obstacle_x_width - 1)
+                node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
+                
+                # Sample obstacle map at node grid positions
+                obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
+                
+                # Clean up GPU memory
+                del X_obstacle_gpu, Y_obstacle_gpu, obstacle_map_full_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
+                print("[GPU] ✓ Obstacle map computed on GPU at full resolution and sampled to node grid")
+            except Exception as e:
+                print(f"[GPU] ⚠ GPU computation failed: {e}, using CPU")
+                # Fallback to CPU vectorized
+                obstacle_map_full = self._calc_obstacle_map_cpu_vectorized(X_obstacle, Y_obstacle, ox_array, oy_array, rr)
+                
+                # Sample full-resolution obstacle map at node grid positions
+                node_x_indices = ((X - self.min_x) / self.obstacle_map_resolution).astype(int)
+                node_y_indices = ((Y - self.min_y) / self.obstacle_map_resolution).astype(int)
+                node_x_indices = np.clip(node_x_indices, 0, obstacle_x_width - 1)
+                node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
+                obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
+        else:
+            # Use CPU vectorized operations
+            obstacle_map_full = self._calc_obstacle_map_cpu_vectorized(X_obstacle, Y_obstacle, ox_array, oy_array, rr)
+            
+            # Sample full-resolution obstacle map at node grid positions
+            node_x_indices = ((X - self.min_x) / self.obstacle_map_resolution).astype(int)
+            node_y_indices = ((Y - self.min_y) / self.obstacle_map_resolution).astype(int)
+            node_x_indices = np.clip(node_x_indices, 0, obstacle_x_width - 1)
+            node_y_indices = np.clip(node_y_indices, 0, obstacle_y_width - 1)
+            obstacle_map = obstacle_map_full[node_x_indices, node_y_indices]
+        
+        # Store full-resolution obstacle map for later use
+        self.obstacle_map_full = obstacle_map_full
+        self.obstacle_map_full_resolution = self.obstacle_map_resolution
+        
+        # Convert to list of lists format expected by parent class (node grid size)
+        self.obstacle_map = [[bool(obstacle_map[ix][iy]) for iy in range(self.y_width)]
+                             for ix in range(self.x_width)]
+    
+    def _calc_obstacle_map_cpu_vectorized(self, X, Y, ox_array, oy_array, rr):
+        """
+        CPU-optimized obstacle map using vectorized NumPy operations.
+        Uses broadcasting to compute all distances at once.
+        """
+        # Compute distances using broadcasting
+        # Shape: (x_width, y_width, num_obstacles)
+        dx = X[:, :, np.newaxis] - ox_array[np.newaxis, np.newaxis, :]
+        dy = Y[:, :, np.newaxis] - oy_array[np.newaxis, np.newaxis, :]
+        distances = np.sqrt(dx * dx + dy * dy)
+        
+        # Check if any obstacle is within robot radius
+        # Shape: (x_width, y_width)
+        obstacle_map = np.any(distances <= rr, axis=2)
+        
+        return obstacle_map
+    
+    def __init__(self, ox, oy, resolution, rr, distance_field=None, use_distance_cost=True, min_clearance_norm=0.50, obstacle_map_resolution=None):
+        # Store obstacle map resolution (for collision detection precision)
+        # If None, use same as node grid resolution
+        self.obstacle_map_resolution = obstacle_map_resolution if obstacle_map_resolution is not None else resolution
+        
+        # Store rr before calling super().__init__ because calc_obstacle_map needs it
+        self._rr_stored = rr
+        
         # Temporarily disable animation in parent class
         original_show = dijkstra.show_animation
         dijkstra.show_animation = False
@@ -476,17 +732,23 @@ class DijkstraPlannerWithTracking(dijkstra.DijkstraPlanner):
         else:
             self.distance_field_norm = None
         
-        # Use GPU for obstacle map if available and usable
+        # Use GPU for obstacle map and distance field if available and usable
         self.use_gpu = False
+        self.distance_field_norm_gpu = None
         if GPU_AVAILABLE and GPU_USABLE:
             try:
                 self.obstacle_map_gpu = cp.asarray(self.obstacle_map)
+                # Also create GPU version of distance field if available
+                if self.distance_field_norm is not None:
+                    self.distance_field_norm_gpu = cp.asarray(self.distance_field_norm)
                 self.use_gpu = True
                 print(f"[GPU] ✓ Using GPU for obstacle map processing")
                 print(f"[GPU] Obstacle map size: {self.x_width}x{self.y_width}")
+                if self.distance_field_norm_gpu is not None:
+                    print(f"[GPU] ✓ Using GPU for distance field lookups")
             except Exception as e:
                 self.use_gpu = False
-                print(f"[GPU] ✗ Failed to initialize GPU obstacle map: {e}")
+                print(f"[GPU] ✗ Failed to initialize GPU arrays: {e}")
                 print("[GPU] Falling back to CPU")
         else:
             self.use_gpu = False
@@ -806,13 +1068,32 @@ class PathFinder:
         """
         cfg = load_planner_config()
         use_distance_cost = cfg["use_distance_cost"] if use_distance_cost is None else use_distance_cost
-        gamma = cfg.get("distance_heat_gamma", 1.0)
-        if min_clearance_norm is None:
-            min_clearance_norm = max(0.05, min(0.95, gamma))
         num_points_per_segment = cfg.get("num_points_per_segment", 15) if num_points_per_segment is None else num_points_per_segment
         smoothing_enabled = cfg.get("smoothing_enabled", True) if smoothing_enabled is None else smoothing_enabled
+        gamma = cfg.get("distance_heat_gamma", 1.0)
+        # Derive clearance from gamma if not explicitly provided
+        if min_clearance_norm is None:
+            min_clearance_norm = max(0.05, min(0.95, gamma))
         # Get obstacles
         ox, oy = self.maze.get_obstacle_list()
+        
+        # Get grid resolution from config (for node grid)
+        grid_resolution = cfg.get("grid_resolution", CELL_SIZE)
+        # Get obstacle map resolution from config (for collision detection)
+        obstacle_map_resolution = cfg.get("obstacle_map_resolution", 1.0)
+        
+        print(f"[Dijkstra] Node grid resolution: {grid_resolution} pixels per node")
+        print(f"[Dijkstra] Obstacle map resolution: {obstacle_map_resolution} pixels per cell (for collision detection)")
+        
+        if grid_resolution > 1.0:
+            print(f"[Dijkstra] Each node represents a {grid_resolution}x{grid_resolution} pixel area")
+            print(f"[Dijkstra] This reduces search space from ~{len(ox)} to ~{int(len(ox) / (grid_resolution * grid_resolution))} nodes")
+        
+        if obstacle_map_resolution == 1.0:
+            print(f"[Dijkstra] ✓ Using full-resolution obstacle map for maximum collision sensitivity")
+        elif obstacle_map_resolution > grid_resolution:
+            print(f"[Dijkstra] ⚠ Obstacle map resolution ({obstacle_map_resolution}) > grid resolution ({grid_resolution})")
+            print(f"[Dijkstra] This provides high collision sensitivity with reduced search space")
         
         # Get distance field if available
         distance_field = None
@@ -828,10 +1109,13 @@ class PathFinder:
                 use_distance_cost = False
         
         # Create Dijkstra planner with tracking and distance field
-        planner = DijkstraPlannerWithTracking(ox, oy, CELL_SIZE, ROBOT_RADIUS,
+        # grid_resolution: controls node grid size (search space)
+        # obstacle_map_resolution: controls obstacle map precision (collision sensitivity)
+        planner = DijkstraPlannerWithTracking(ox, oy, grid_resolution, ROBOT_RADIUS,
                                              distance_field=distance_field,
                                              use_distance_cost=use_distance_cost,
-                                             min_clearance_norm=min_clearance_norm)
+                                             min_clearance_norm=min_clearance_norm,
+                                             obstacle_map_resolution=obstacle_map_resolution)
         
         # Find path
         sx, sy = self.maze.start
@@ -1087,6 +1371,7 @@ def load_maze_from_maps():
     detection_mode = config.get("detection_mode", "canny")
     canny_threshold1 = config.get("canny_threshold1", 100)
     canny_threshold2 = config.get("canny_threshold2", 200)
+    sobel_threshold = config.get("sobel_threshold", 50)
     map_file = config.get("map_file")
     
     # Choose image: prefer map_file from config if it exists; otherwise prefer sophisticated_maze.png
@@ -1113,7 +1398,8 @@ def load_maze_from_maps():
         maze = Maze.from_image(image_path, 
                               detection_mode=detection_mode,
                               canny_threshold1=canny_threshold1,
-                              canny_threshold2=canny_threshold2)
+                              canny_threshold2=canny_threshold2,
+                              sobel_threshold=sobel_threshold)
         print(f"Successfully loaded maze: {maze.width}x{maze.height}")
         print(f"Start position: {maze.start}")
         print(f"Exit position: {maze.exit}")

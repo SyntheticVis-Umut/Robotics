@@ -41,12 +41,12 @@ A simple maze game where a creature uses different pathfinding algorithms to fin
 
 **Step 1: Create a new conda environment**
 ```bash
-conda create -n maze_game python=3.9 -y
+conda create -n robotics python=3.9 -y
 ```
 
 **Step 2: Activate the environment**
 ```bash
-conda activate maze_game
+conda activate robotics
 ```
 
 **Step 3: Install required packages**
@@ -54,6 +54,7 @@ conda activate maze_game
 # Core dependencies
 conda install matplotlib numpy scipy -y
 pip install Pillow
+pip install opencv-python
 
 # Optional: Performance optimizations (recommended)
 pip install numba
@@ -88,31 +89,31 @@ pip install matplotlib numpy scipy Pillow numba
 **A* Algorithm:**
 ```bash
 cd /Users/umutozdemir/Desktop/Robotics
-conda activate maze_game
+conda activate robotics
 python AStar.py
 ```
 
 **Dijkstra Algorithm:**
 ```bash
-conda run -n maze_game python Dijkstra.py
+conda run -n robotics python Dijkstra.py
 ```
 
 **Hybrid A* Algorithm:**
 ```bash
-conda run -n maze_game python HybridAStar.py
+conda run -n robotics python HybridAStar.py
 ```
 
 **PSO Algorithm:**
 ```bash
-conda run -n maze_game python PSO.py
+conda run -n robotics python PSO.py
 ```
 
 Or using conda run:
 ```bash
-conda run -n maze_game python AStar.py      # A*
-conda run -n maze_game python Dijkstra.py   # Dijkstra
-conda run -n maze_game python HybridAStar.py # Hybrid A*
-conda run -n maze_game python PSO.py        # PSO
+conda run -n robotics python AStar.py      # A*
+conda run -n robotics python Dijkstra.py   # Dijkstra
+conda run -n robotics python HybridAStar.py # Hybrid A*
+conda run -n robotics python PSO.py        # PSO
 ```
 
 ### Using Default Python

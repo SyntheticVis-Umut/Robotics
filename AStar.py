@@ -67,7 +67,51 @@ except ImportError:
     print("[Numba] Install numba for speedup: pip install numba")
 
 # Add the pythonrobotics path to import A* algorithm
-sys.path.insert(0, '/Users/umutozdemir/Desktop/pythonrobotics')
+def find_pythonrobotics_path():
+    """Dynamically find the pythonrobotics directory path."""
+    # Get the directory where this script is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Strategy 1: Check if pythonrobotics is a sibling directory
+    parent_dir = os.path.dirname(current_dir)
+    sibling_path = os.path.join(parent_dir, 'pythonrobotics')
+    if os.path.exists(sibling_path) and os.path.isdir(sibling_path):
+        return sibling_path
+    
+    # Strategy 2: Check if pythonrobotics is in the current directory's parent
+    # (for cases where Robotics is inside pythonrobotics)
+    grandparent_dir = os.path.dirname(parent_dir)
+    grandparent_path = os.path.join(grandparent_dir, 'pythonrobotics')
+    if os.path.exists(grandparent_path) and os.path.isdir(grandparent_path):
+        return grandparent_path
+    
+    # Strategy 3: Search up the directory tree
+    search_dir = current_dir
+    for _ in range(5):  # Search up to 5 levels
+        search_dir = os.path.dirname(search_dir)
+        pythonrobotics_path = os.path.join(search_dir, 'pythonrobotics')
+        if os.path.exists(pythonrobotics_path) and os.path.isdir(pythonrobotics_path):
+            return pythonrobotics_path
+    
+    # Strategy 4: Check common locations
+    home_dir = os.path.expanduser('~')
+    common_paths = [
+        os.path.join(home_dir, 'Desktop', 'pythonrobotics'),
+        os.path.join(home_dir, 'Documents', 'pythonrobotics'),
+        os.path.join(home_dir, 'pythonrobotics'),
+    ]
+    for path in common_paths:
+        if os.path.exists(path) and os.path.isdir(path):
+            return path
+    
+    # If not found, raise an error
+    raise FileNotFoundError(
+        "Could not find pythonrobotics directory. Please ensure it's accessible. "
+        f"Searched from: {current_dir}"
+    )
+
+pythonrobotics_path = find_pythonrobotics_path()
+sys.path.insert(0, pythonrobotics_path)
 from PathPlanning.AStar import a_star
 from PathPlanning.Catmull_RomSplinePath.catmull_rom_spline_path import catmull_rom_spline
 from Mapping.DistanceMap.distance_map import compute_udf_scipy, compute_sdf_scipy
