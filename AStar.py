@@ -1748,6 +1748,18 @@ class MazeGame:
         """Draw walls as continuous rectangles instead of individual cells"""
         # Create a 2D array to mark wall cells
         wall_map = np.zeros((self.maze.width, self.maze.height), dtype=bool)
+        
+        # If canny_edge_map exists (from edge detection or direct mode), use it
+        if self.maze.canny_edge_map is not None:
+            # canny_edge_map is in (height, width) format, where obstacles are > 0
+            # Convert to (width, height) format for wall_map
+            edge_map = self.maze.canny_edge_map
+            for y in range(self.maze.height):
+                for x in range(self.maze.width):
+                    if edge_map[y, x] > 0:  # Obstacle pixel
+                        wall_map[x, y] = True
+        
+        # Also add walls from the walls set (for legacy mode)
         for wall_x, wall_y in self.maze.walls:
             if 0 <= wall_x < self.maze.width and 0 <= wall_y < self.maze.height:
                 wall_map[int(wall_x), int(wall_y)] = True
@@ -1829,8 +1841,10 @@ class MazeGame:
                 plt.colorbar(distance_plot, ax=self.ax, label='Distance to Nearest Obstacle', shrink=0.8)
                 self._colorbar_added = True
         
-        # Draw obstacle map (if enabled and available)
+        # Load config for visualization options
         cfg = load_planner_config()
+        
+        # Draw obstacle map (if enabled and available)
         show_obstacle_map = cfg.get("show_obstacle_map", True)
         if show_obstacle_map and self.pathfinder.planner is not None:
             planner = self.pathfinder.planner
@@ -1871,8 +1885,33 @@ class MazeGame:
                     zorder=1  # Above distance field, below walls
                 )
         
-        # Draw walls as continuous rectangles
-        self._draw_walls_as_rectangles()
+        # Draw node grid (if enabled)
+        show_grid = cfg.get("show_grid", True)
+        if show_grid and self.pathfinder.planner is not None:
+            planner = self.pathfinder.planner
+            grid_resolution = cfg.get("grid_resolution", 1.0)
+            
+            # Get planner bounds (these define the actual grid extent)
+            if hasattr(planner, 'min_x') and hasattr(planner, 'max_x') and \
+               hasattr(planner, 'min_y') and hasattr(planner, 'max_y'):
+                min_x, max_x = planner.min_x, planner.max_x
+                min_y, max_y = planner.min_y, planner.max_y
+                
+                # Draw vertical grid lines
+                x_lines = np.arange(min_x, max_x + grid_resolution, grid_resolution)
+                for x in x_lines:
+                    self.ax.axvline(x, color='gray', linestyle='--', linewidth=0.5, 
+                                  alpha=0.4, zorder=1.5)
+                
+                # Draw horizontal grid lines
+                y_lines = np.arange(min_y, max_y + grid_resolution, grid_resolution)
+                for y in y_lines:
+                    self.ax.axhline(y, color='gray', linestyle='--', linewidth=0.5, 
+                                  alpha=0.4, zorder=1.5)
+        
+        # Draw walls as continuous rectangles (only if show_obstacle_map is enabled)
+        if show_obstacle_map:
+            self._draw_walls_as_rectangles()
         
         # Draw start position (bold circle)
         sx, sy = self.maze.start
