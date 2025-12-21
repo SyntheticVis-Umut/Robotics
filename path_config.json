@@ -10,7 +10,7 @@
   "canny_threshold1": 100,
   "canny_threshold2": 200,
   "sobel_threshold": 50,
-  "map_file": "maze_86x86.png",
+  "map_file": "map_.png",
   "grid_resolution": 1.0,
   "obstacle_map_resolution": 1.0
 }
