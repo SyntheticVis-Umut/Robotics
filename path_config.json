@@ -5,12 +5,12 @@
   "use_distance_field_only": false,
   "show_obstacle_map": true,
   "smoothing_enabled": true,
-  "distance_heat_gamma": 0.1,
+  "distance_heat_gamma": 0.2,
   "detection_mode": "canny",
   "canny_threshold1": 100,
   "canny_threshold2": 200,
   "sobel_threshold": 50,
-  "map_file": "map.png",
+  "map_file": "maze_86x86.png",
   "grid_resolution": 1.0,
   "obstacle_map_resolution": 1.0
 }

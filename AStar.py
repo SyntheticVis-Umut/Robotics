@@ -1858,7 +1858,7 @@ class MazeGame:
                     obstacle_vis = obstacle_map.astype(float)
                 
                 # Use same extent as distance map to ensure alignment
-                extent = [-1, self.maze.width - , -0.5, self.maze.height - 0.5]
+                extent = [-1.5, self.maze.width - 1.5, -1.5, self.maze.height - 1.5]
                 
                 # Draw obstacle map as semi-transparent overlay
                 obstacle_plot = self.ax.imshow(
